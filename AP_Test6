@@ -1,0 +1,1020 @@
+import customtkinter as ctk
+import sys
+import threading
+from datetime import datetime
+import serial  
+import serial.tools.list_ports
+import time    
+from PIL import Image
+import os
+import struct
+
+# Set appearance
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+class QTMOrchestrator(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        # Configure window
+        self.title("ASIS Automated Production System")
+        self.geometry("1000x700")
+        self.minsize(900, 600)
+        self.center_window()
+        
+        # Status variables
+        self.current_status = "Ready"
+        self.connection_status = "Disconnected"
+        self.last_update = "Never"
+        
+        # Default settings
+        self.current_com_port = "Auto Detect"
+        self.current_baud_rate = 9600
+        
+        # Protocol constants
+        self.PROTOCOL_ASIS = 0x60
+        self.SYNC_BYTE = 0xAA
+        self.BOARD_ADDRESS = 0xE1
+        
+        # Transaction tracking
+        self.transaction_id = 0x0001
+        
+        # Command tracking for xN/yN convention
+        self.command_counter = 1
+        
+        # Serial connection
+        self.ser = None
+        self.monitoring_active = False
+        
+        # Buffer for incoming data
+        self.rx_buffer = bytearray()
+        
+        # Initialize UI
+        self.setup_ui()
+        
+    def center_window(self):
+        """Center the window on the screen"""
+        self.update_idletasks()
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        window_width = 1000
+        window_height = 700
+        
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        
+        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
+    
+    def setup_ui(self):
+        # Create main grid
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        
+        # Header
+        self.header_frame = ctk.CTkFrame(self, corner_radius=0)
+        self.header_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        self.header_frame.grid_columnconfigure(0, weight=1)
+        
+        # Setup logo
+        self.setup_logo()
+        
+        ctk.CTkLabel(self.header_frame, text="Automated Production System", 
+                    font=ctk.CTkFont(size=20, weight="bold"), text_color="gray").grid(row=1, column=0, pady=(0, 20))
+        
+        # Main content area
+        self.main_frame = ctk.CTkFrame(self)
+        self.main_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=20)
+        self.main_frame.grid_columnconfigure(0, weight=1)
+        self.main_frame.grid_rowconfigure(0, weight=0)
+        self.main_frame.grid_rowconfigure(1, weight=1)
+        self.main_frame.grid_rowconfigure(2, weight=2)
+        
+        # Setup all UI components
+        self.setup_status_dashboard()
+        self.setup_control_panel()
+        self.setup_log_panel()
+    
+    def setup_logo(self):
+        """Simple and safe logo setup"""
+        try:
+            logo_path = "asis_logo.png"
+            if os.path.exists(logo_path):
+                pil_image = Image.open(logo_path)
+                logo_image = ctk.CTkImage(
+                    light_image=pil_image,
+                    dark_image=pil_image,
+                    size=(250, 60)
+                )
+                logo_label = ctk.CTkLabel(self.header_frame, image=logo_image, text="")
+                logo_label.grid(row=0, column=0, pady=15)
+            else:
+                raise FileNotFoundError("Logo file not found")
+        except Exception as e:
+            ctk.CTkLabel(self.header_frame, text="ASIS TECHNOLOGIES", 
+                        font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, pady=20)
+    
+    def setup_status_dashboard(self):
+        """Setup status dashboard in a single row"""
+        # Status frame
+        status_frame = ctk.CTkFrame(self.main_frame)
+        status_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+        
+        # Configure columns for each status indicator
+        for i in range(5):
+            status_frame.grid_columnconfigure(i, weight=1)
+        
+        # Title
+        ctk.CTkLabel(status_frame, text="STATUS DASHBOARD", 
+                    font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, columnspan=5, pady=(10, 15))
+        
+        # Status indicators in one row
+        self.status_indicators = {}
+        
+        indicators = [
+            ("MAIN STATUS", "main_status", "Ready", "gray"),
+            ("CONNECTION", "connection_status", "Disconnected", "gray"),
+            ("DATA FLOW", "data_status", "No Data", "gray"),
+            ("DEVICE HEALTH", "health_status", "Unknown", "gray")
+        ]
+        
+        # Create all indicators
+        for i, (label, key, value, color) in enumerate(indicators):
+            indicator_container = ctk.CTkFrame(status_frame, fg_color="transparent")
+            indicator_container.grid(row=1, column=i, sticky="nsew", padx=5, pady=5)
+            indicator_container.grid_columnconfigure(0, weight=1)
+            
+            ctk.CTkLabel(indicator_container, text=label, 
+                        font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="ew", pady=(0, 2))
+            
+            self.status_indicators[key] = ctk.CTkLabel(indicator_container, text=value,
+                                                     text_color=color,
+                                                     font=ctk.CTkFont(size=12, weight="bold"))
+            self.status_indicators[key].grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        
+        # Last update section
+        last_update_container = ctk.CTkFrame(status_frame, fg_color="transparent")
+        last_update_container.grid(row=1, column=4, sticky="nsew", padx=5, pady=5)
+        last_update_container.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(last_update_container, text="LAST UPDATE", 
+                    font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        
+        self.last_update_label = ctk.CTkLabel(last_update_container, text="Never",
+                                            font=ctk.CTkFont(size=12), text_color="gray")
+        self.last_update_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+    
+    def setup_control_panel(self):
+        """Setup control panel"""
+        control_frame = ctk.CTkFrame(self.main_frame)
+        control_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        control_frame.grid_columnconfigure(0, weight=1)
+        
+        # Title
+        ctk.CTkLabel(control_frame, text="CONTROL PANEL", 
+                    font=ctk.CTkFont(size=16, weight="bold")).pack(pady=10)
+        
+        # Main buttons frame
+        main_button_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        main_button_frame.pack(pady=10)
+        
+        # Action buttons
+        self.start_btn = ctk.CTkButton(main_button_frame, text="▶ START TESTING", 
+                                      command=self.start_monitoring,
+                                      font=ctk.CTkFont(size=14, weight="bold"),
+                                      height=40, fg_color="#2E7D32", hover_color="#1B5E20")
+        self.start_btn.pack(side="left", padx=10, pady=10)
+        
+        self.stop_btn = ctk.CTkButton(main_button_frame, text="■ STOP", 
+                                     command=self.stop_monitoring,
+                                     font=ctk.CTkFont(size=14, weight="bold"),
+                                     height=40, fg_color="#C62828", hover_color="#B71C1C",
+                                     state="disabled")
+        self.stop_btn.pack(side="left", padx=10, pady=10)
+        
+        self.settings_btn = ctk.CTkButton(main_button_frame, text="⚙ SETTINGS", 
+                                         command=self.show_settings,
+                                         font=ctk.CTkFont(size=14),
+                                         height=40)
+        self.settings_btn.pack(side="left", padx=10, pady=10)
+        
+        self.refresh_btn = ctk.CTkButton(main_button_frame, text="🔄 REFRESH PORTS", 
+                                        command=self.refresh_com_ports,
+                                        font=ctk.CTkFont(size=14),
+                                        height=40)
+        self.refresh_btn.pack(side="left", padx=10, pady=10)
+        
+        # QTM specific buttons frame
+        qtm_button_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        qtm_button_frame.pack(pady=10)
+        
+        # Row 1 buttons
+        button_row1 = ctk.CTkFrame(qtm_button_frame, fg_color="transparent")
+        button_row1.pack(pady=5)
+        
+        self.poll_btn = ctk.CTkButton(button_row1, text="x1: POLL DEVICE", 
+                                     command=lambda: self.send_command("x1", 0x30),
+                                     font=ctk.CTkFont(size=12),
+                                     height=30,
+                                     state="disabled")
+        self.poll_btn.pack(side="left", padx=5, pady=5)
+        
+        self.button_btn = ctk.CTkButton(button_row1, text="x2: READ BUTTONS", 
+                                       command=lambda: self.send_command("x2", 0x31),
+                                       font=ctk.CTkFont(size=12),
+                                       height=30,
+                                       state="disabled")
+        self.button_btn.pack(side="left", padx=5, pady=5)
+        
+        self.relay_btn = ctk.CTkButton(button_row1, text="x3: WRITE RELAY", 
+                                      command=lambda: self.send_command("x3", 0x33),
+                                      font=ctk.CTkFont(size=12),
+                                      height=30,
+                                      state="disabled")
+        self.relay_btn.pack(side="left", padx=5, pady=5)
+        
+        # Row 2 buttons
+        button_row2 = ctk.CTkFrame(qtm_button_frame, fg_color="transparent")
+        button_row2.pack(pady=5)
+        
+        self.input_cap_btn = ctk.CTkButton(button_row2, text="x4: READ INPUT CAP", 
+                                         command=lambda: self.send_command("x4", 0x32),
+                                         font=ctk.CTkFont(size=12),
+                                         height=30,
+                                         state="disabled")
+        self.input_cap_btn.pack(side="left", padx=5, pady=5)
+        
+        self.adc_btn = ctk.CTkButton(button_row2, text="x5: READ ADC", 
+                                    command=lambda: self.send_command("x5", 0x34),
+                                    font=ctk.CTkFont(size=12),
+                                    height=30,
+                                    state="disabled")
+        self.adc_btn.pack(side="left", padx=5, pady=5)
+        
+        self.traffic_btn = ctk.CTkButton(button_row2, text="x6: TRAFFIC LIGHT", 
+                                        command=lambda: self.send_command("x6", 0x35),
+                                        font=ctk.CTkFont(size=12),
+                                        height=30,
+                                        state="disabled")
+        self.traffic_btn.pack(side="left", padx=5, pady=5)
+        
+        self.debug_btn = ctk.CTkButton(button_row2, text="DEBUG CONNECTION", 
+                                     command=self.debug_connection,
+                                     font=ctk.CTkFont(size=12),
+                                     height=30)
+        self.debug_btn.pack(side="left", padx=5, pady=5)
+        
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(control_frame, height=20)
+        self.progress_bar.pack(fill="x", padx=20, pady=10)
+        self.progress_bar.set(0)
+    
+    def setup_log_panel(self):
+        """Setup log panel"""
+        log_frame = ctk.CTkFrame(self.main_frame)
+        log_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(1, weight=1)
+        
+        ctk.CTkLabel(log_frame, text="EVENT LOG", 
+                    font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=10)
+        
+        # Text box for logs
+        self.log_text = ctk.CTkTextbox(log_frame)
+        self.log_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.log_text.insert("1.0", "System initialized. Ready to start monitoring...\n")
+    
+    # ========== ENHANCED QTM COMMUNICATION ==========
+    
+    def calculate_crc16(self, data):
+        """Calculate CRC-16 checksum for Modbus protocol"""
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA001
+                else:
+                    crc = crc >> 1
+        return crc
+    
+    def build_asis_frame(self, function_code, data_bytes=None):
+        """Build ASIS protocol frame with dual-length security"""
+        if data_bytes is None:
+            data_bytes = [0x11, 0x22, 0x01]  # Default filler data
+        
+        self.transaction_id = (self.transaction_id + 1) & 0xFFFF
+        
+        # Build the core frame (th to dn)
+        core_frame = bytearray()
+        
+        # Header (th tl ph pl)
+        core_frame.extend([
+            (self.transaction_id >> 8) & 0xFF,  # Th
+            self.transaction_id & 0xFF,         # Tl
+            0x00,                               # Ph
+            self.PROTOCOL_ASIS,                 # Pl
+        ])
+        
+        # Calculate Modbus length (lh ll) - from ba to last data byte
+        modbus_data_length = 1 + 1 + len(data_bytes)  # ba + fc + data bytes
+        core_frame.extend([
+            (modbus_data_length >> 8) & 0xFF,   # Lh
+            modbus_data_length & 0xFF           # Ll
+        ])
+        
+        # Add device address and function code (ba fc)
+        core_frame.extend([
+            self.BOARD_ADDRESS,                 # Ba
+            function_code                       # Fc
+        ])
+        
+        # Add data bytes (d0 d1...)
+        core_frame.extend(data_bytes)
+        
+        # Calculate CRC-16 for the Modbus part (ba to last data byte)
+        modbus_part = core_frame[6:]  # From ba to end
+        crc = self.calculate_crc16(modbus_part)
+        
+        # Add CRC (ch cl) - little endian
+        core_frame.extend([
+            crc & 0xFF,         # Cl (low byte first)
+            (crc >> 8) & 0xFF   # Ch (high byte second)
+        ])
+        
+        # Calculate ASIS total length (it) - from th to cl
+        asis_total_length = len(core_frame)
+        core_frame.append(asis_total_length)  # It
+        
+        # Add post header (pl)
+        core_frame.append(self.SYNC_BYTE)  # Pl ($AA)
+        
+        return bytes(core_frame)
+    
+    def get_command_data(self, function_code):
+        """Get appropriate data bytes for each command type"""
+        data_map = {
+            0x30: [0x11, 0x22, 0x01],  # Poll - filler data
+            0x31: [0x11, 0x22, 0x01],  # Read buttons - filler data
+            0x32: [0x11, 0x22, 0x01],  # Read input capture - filler data
+            0x33: [0x00, 0x00, 0x01],  # Write relay - both off
+            0x34: [0x11, 0x22, 0x01],  # Read ADC - filler data
+            0x35: [0x00, 0x00, 0x00],  # Traffic light - all off
+        }
+        return data_map.get(function_code, [0x11, 0x22, 0x01])
+    
+    def send_command(self, command_name, function_code):
+        """Send a command with xN naming convention"""
+        if not self.ser or not self.ser.is_open:
+            self.log_event(f"❌ {command_name}: Not connected to device", "ERROR")
+            return
+        
+        try:
+            data_bytes = self.get_command_data(function_code)
+            frame = self.build_asis_frame(function_code, data_bytes)
+            
+            # Log the sent command with xN naming
+            hex_frame = ' '.join([f"{b:02X}" for b in frame])
+            self.log_event(f"➡️ {command_name} SENT: {hex_frame}", "INFO")
+            
+            # Send the frame
+            self.ser.write(frame)
+            self.ser.flush()
+            
+            # Start response monitoring thread
+            thread = threading.Thread(
+                target=self.monitor_response, 
+                args=(command_name, function_code + 0x10),  # Expected ack code
+                daemon=True
+            )
+            thread.start()
+            
+        except Exception as e:
+            self.log_event(f"❌ {command_name} Error: {str(e)}", "ERROR")
+    
+    def parse_modbus_frame(self, data):
+        """Parse incoming Modbus frame and validate structure"""
+        if len(data) < 12:  # Minimum frame size
+            return None, "Frame too short"
+        
+        # Check for sync byte at the end
+        if data[-1] != self.SYNC_BYTE:
+            return None, "Missing sync byte"
+        
+        # Extract frame components
+        try:
+            # th tl ph pl lh ll ba fc ... ch cl it pl
+            transaction_id = (data[0] << 8) | data[1]
+            protocol_id = (data[2] << 8) | data[3]
+            modbus_length = (data[4] << 8) | data[5]
+            board_address = data[6]
+            function_code = data[7]
+            
+            # Calculate expected data length
+            expected_data_length = modbus_length - 2  # minus ba and fc
+            
+            # Verify frame length matches
+            if len(data) != (6 + modbus_length + 2 + 1 + 1):  # header + modbus_data + crc + total_len + sync
+                return None, "Frame length mismatch"
+            
+            # Extract data bytes
+            data_bytes = data[8:8+expected_data_length]
+            
+            # Extract CRC
+            crc_received = (data[8+expected_data_length+1] << 8) | data[8+expected_data_length]
+            
+            # Calculate CRC for verification
+            modbus_part = data[6:8+expected_data_length]  # ba to last data byte
+            crc_calculated = self.calculate_crc16(modbus_part)
+            
+            if crc_received != crc_calculated:
+                return None, f"CRC mismatch: got {crc_received:04X}, calculated {crc_calculated:04X}"
+            
+            frame_info = {
+                'transaction_id': transaction_id,
+                'protocol_id': protocol_id,
+                'modbus_length': modbus_length,
+                'board_address': board_address,
+                'function_code': function_code,
+                'data_bytes': data_bytes,
+                'crc_received': crc_received,
+                'total_length': data[-2],
+                'raw_data': data
+            }
+            
+            return frame_info, "Valid frame"
+            
+        except Exception as e:
+            return None, f"Parse error: {str(e)}"
+    
+    def monitor_response(self, command_name, expected_ack_code):
+        """Monitor for response with yN naming convention"""
+        try:
+            start_time = time.time()
+            timeout = 3  # 3 second timeout
+            
+            while time.time() - start_time < timeout:
+                if self.ser and self.ser.in_waiting > 0:
+                    # Read all available data
+                    response = self.ser.read(self.ser.in_waiting)
+                    
+                    # Add to buffer
+                    self.rx_buffer.extend(response)
+                    
+                    # Try to find complete frames in buffer
+                    while len(self.rx_buffer) >= 12:  # Minimum frame size
+                        # Look for sync byte as frame delimiter
+                        sync_pos = -1
+                        for i in range(len(self.rx_buffer)):
+                            if self.rx_buffer[i] == self.SYNC_BYTE and i >= 11:
+                                sync_pos = i
+                                break
+                        
+                        if sync_pos == -1:
+                            break  # No complete frame found
+                        
+                        # Extract frame (from beginning to sync byte inclusive)
+                        frame_data = self.rx_buffer[:sync_pos+1]
+                        self.rx_buffer = self.rx_buffer[sync_pos+1:]
+                        
+                        # Parse the frame
+                        frame_info, status = self.parse_modbus_frame(frame_data)
+                        
+                        if frame_info:
+                            hex_response = ' '.join([f"{b:02X}" for b in frame_data])
+                            response_name = command_name.replace('x', 'y')
+                            
+                            if frame_info['function_code'] == expected_ack_code:
+                                self.log_event(f"✅ {response_name} RECEIVED: {hex_response}", "SUCCESS")
+                                self.log_event(f"   Parsed: FC=0x{frame_info['function_code']:02X}, Data={frame_info['data_bytes'].hex().upper()}", "INFO")
+                            else:
+                                self.log_event(f"⚠️ {response_name} UNEXPECTED: {hex_response}", "WARNING")
+                                self.log_event(f"   Expected FC=0x{expected_ack_code:02X}, Got FC=0x{frame_info['function_code']:02X}", "WARNING")
+                            
+                            return
+                        else:
+                            hex_response = ' '.join([f"{b:02X}" for b in frame_data])
+                            self.log_event(f"❌ {command_name} INVALID FRAME: {status}", "ERROR")
+                            self.log_event(f"   Raw: {hex_response}", "INFO")
+                
+                time.sleep(0.1)
+            
+            # Timeout reached
+            self.log_event(f"⏰ {command_name.replace('x', 'y')} TIMEOUT: No response received", "WARNING")
+            
+        except Exception as e:
+            self.log_event(f"❌ {command_name.replace('x', 'y')} Error: {str(e)}", "ERROR")
+    
+    def debug_connection(self):
+        """Comprehensive connection debugging"""
+        self.log_event("🔧 Starting comprehensive connection debug...", "INFO")
+        thread = threading.Thread(target=self._perform_debug, daemon=True)
+        thread.start()
+    
+    def _perform_debug(self):
+        """Perform detailed connection debugging"""
+        try:
+            # Step 1: Show available ports
+            self.log_event("Step 1: Checking available COM ports...", "INFO")
+            ports = serial.tools.list_ports.comports()
+            if not ports:
+                self.log_event("❌ No COM ports found!", "ERROR")
+                return
+            
+            for port in ports:
+                self.log_event(f"   Found: {port.device} - {port.description}", "INFO")
+                if port.manufacturer:
+                    self.log_event(f"     Manufacturer: {port.manufacturer}", "INFO")
+            
+            # Step 2: Test each port with different configurations
+            self.log_event("Step 2: Testing ports with different configurations...", "INFO")
+            
+            test_configs = [
+                {"baudrate": 9600, "description": "Standard 9600"},
+                {"baudrate": 19200, "description": "19200"},
+                {"baudrate": 38400, "description": "38400"}, 
+                {"baudrate": 115200, "description": "115200"},
+            ]
+            
+            for port in ports:
+                port_name = port.device
+                self.log_event(f"Testing {port_name}...", "INFO")
+                
+                for config in test_configs:
+                    success = self._test_port_config(port_name, config)
+                    if success:
+                        self.log_event(f"✅ SUCCESS on {port_name} with {config['description']}", "SUCCESS")
+                        # Save the working configuration
+                        self.current_com_port = port_name
+                        self.current_baud_rate = config['baudrate']
+                        return
+                    else:
+                        self.log_event(f"   Failed with {config['description']}", "INFO")
+            
+            self.log_event("❌ No working configuration found!", "ERROR")
+            
+        except Exception as e:
+            self.log_event(f"Debug error: {str(e)}", "ERROR")
+    
+    def _test_port_config(self, port, config):
+        """Test a specific port configuration"""
+        try:
+            self.log_event(f"   Trying {config['description']}...", "INFO")
+            
+            ser = serial.Serial(
+                port=port,
+                baudrate=config['baudrate'],
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=2,
+                write_timeout=2
+            )
+            
+            # Test 1: Check if port opens
+            if not ser.is_open:
+                return False
+            
+            # Test 2: Clear buffers and wait
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            time.sleep(0.5)
+            
+            # Test 3: Send poll command
+            try:
+                poll_frame = self.build_asis_frame(0x30)  # Poll command
+                self.log_event("     Sending poll command...", "INFO")
+                ser.write(poll_frame)
+                ser.flush()
+                
+                # Wait for response with longer timeout
+                time.sleep(2)
+                
+                # Check for response
+                if ser.in_waiting > 0:
+                    response = ser.read(ser.in_waiting)
+                    if response:
+                        hex_response = ' '.join([f"{b:02X}" for b in response])
+                        self.log_event(f"     ✅ Got response: {hex_response}", "SUCCESS")
+                        
+                        # Try to parse it
+                        frame_info, status = self.parse_modbus_frame(response)
+                        if frame_info:
+                            self.log_event(f"     ✅ Valid Modbus frame: {status}", "SUCCESS")
+                        else:
+                            self.log_event(f"     ⚠️ Raw data: {status}", "INFO")
+                        
+                        ser.close()
+                        return True
+                
+            except Exception as e:
+                self.log_event(f"     Command error: {str(e)}", "INFO")
+            
+            ser.close()
+            return False
+            
+        except Exception as e:
+            return False
+    
+    def connect_to_qtm(self):
+        """Connect to QTM device with current settings"""
+        try:
+            # Determine port
+            if self.current_com_port == "Auto Detect":
+                port = self.auto_detect_qtm_port()
+                if not port:
+                    return False
+            else:
+                port = self.current_com_port
+            
+            self.log_event(f"Connecting to {port} at {self.current_baud_rate} baud...", "INFO")
+            
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=self.current_baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,  # Shorter timeout for better responsiveness
+                write_timeout=2
+            )
+            
+            # Clear any existing data
+            self.ser.reset_input_buffer()
+            self.ser.reset_output_buffer()
+            self.rx_buffer = bytearray()
+            
+            # Test connection with poll command
+            test_frame = self.build_asis_frame(0x30)  # Poll command
+            self.ser.write(test_frame)
+            self.ser.flush()
+            
+            time.sleep(2)  # Wait for response
+            
+            if self.ser.in_waiting > 0:
+                response = self.ser.read(self.ser.in_waiting)
+                hex_response = ' '.join([f"{b:02X}" for b in response])
+                self.log_event(f"✅ Connection successful! Response: {hex_response}", "SUCCESS")
+                
+                # Try to parse the response
+                frame_info, status = self.parse_modbus_frame(response)
+                if frame_info:
+                    self.log_event(f"✅ Valid Modbus frame received", "SUCCESS")
+                else:
+                    self.log_event(f"⚠️ Raw data received: {status}", "WARNING")
+                    
+                return True
+            else:
+                self.log_event("⚠️ Connected but no response received - device may be in different mode", "WARNING")
+                return True  # Still return True as port is open
+                
+        except Exception as e:
+            self.log_event(f"❌ Connection failed: {str(e)}", "ERROR")
+            return False
+    
+    def auto_detect_qtm_port(self):
+        """Auto-detect QTM device port"""
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        
+        for port in ports:
+            try:
+                self.log_event(f"Testing {port}...", "INFO")
+                
+                # Try common baud rates
+                for baud in [9600, 19200, 38400, 115200]:
+                    try:
+                        ser = serial.Serial(
+                            port=port,
+                            baudrate=baud,
+                            bytesize=serial.EIGHTBITS,
+                            parity=serial.PARITY_NONE,
+                            stopbits=serial.STOPBITS_ONE,
+                            timeout=1
+                        )
+                        
+                        # Clear buffers
+                        ser.reset_input_buffer()
+                        ser.reset_output_buffer()
+                        time.sleep(0.5)
+                        
+                        # Send poll command
+                        test_frame = self.build_asis_frame(0x30)
+                        ser.write(test_frame)
+                        time.sleep(1)
+                        
+                        if ser.in_waiting > 0:
+                            response = ser.read(ser.in_waiting)
+                            ser.close()
+                            self.current_baud_rate = baud
+                            self.log_event(f"✅ Found QTM on {port} at {baud} baud", "SUCCESS")
+                            return port
+                        
+                        ser.close()
+                    except:
+                        continue
+                        
+            except Exception as e:
+                continue
+        
+        return None
+    
+    # ========== UI CONTROL METHODS ==========
+    
+    def update_status(self, key, message, color="white"):
+        """Update status indicator"""
+        if key in self.status_indicators:
+            self.status_indicators[key].configure(text=message, text_color=color)
+    
+    def log_event(self, message, level="INFO"):
+        """Add event to log"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color_map = {"INFO": "white", "SUCCESS": "#4CAF50", "ERROR": "#F44336", "WARNING": "#FF9800"}
+        color = color_map.get(level, "white")
+        
+        log_entry = f"[{timestamp}] {level}: {message}\n"
+        self.log_text.insert("end", log_entry)
+        self.log_text.see("end")
+        
+        self.last_update_label.configure(text=f"Last Update: {timestamp}")
+    
+    def start_monitoring(self):
+        """Start the monitoring process"""
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.poll_btn.configure(state="normal")
+        self.button_btn.configure(state="normal")
+        self.relay_btn.configure(state="normal")
+        self.input_cap_btn.configure(state="normal")
+        self.adc_btn.configure(state="normal")
+        self.traffic_btn.configure(state="normal")
+        self.progress_bar.start()
+        
+        self.update_status("main_status", "Monitoring...", "#FF9800")
+        self.update_status("connection_status", "Connecting...", "#FF9800")
+        self.log_event("Starting QTM device monitoring", "INFO")
+        
+        self.monitoring_active = True
+        thread = threading.Thread(target=self.monitoring_loop, daemon=True)
+        thread.start()
+    
+    def stop_monitoring(self):
+        """Stop the monitoring process"""
+        self.monitoring_active = False
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.poll_btn.configure(state="disabled")
+        self.button_btn.configure(state="disabled")
+        self.relay_btn.configure(state="disabled")
+        self.input_cap_btn.configure(state="disabled")
+        self.adc_btn.configure(state="disabled")
+        self.traffic_btn.configure(state="disabled")
+        self.progress_bar.stop()
+        
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            self.log_event("Serial connection closed", "INFO")
+        
+        self.update_status("main_status", "Stopped", "#F44336")
+        self.update_status("connection_status", "Disconnected", "gray")
+        self.log_event("Monitoring stopped", "INFO")
+    
+    def monitoring_loop(self):
+        """Main monitoring loop"""
+        try:
+            if self.connect_to_qtm():
+                self.after(0, self.update_status, "connection_status", "Connected", "#4CAF50")
+                self.after(0, self.update_status, "health_status", "Connected", "#4CAF50")
+                
+                # Main loop
+                cycle_count = 0
+                while self.monitoring_active:
+                    cycle_count += 1
+                    
+                    self.after(0, self.update_status, "data_status", f"Active - Cycle {cycle_count}", "#2196F3")
+                    
+                    # Check for incoming data (including auto-send messages like eBtnIRQ)
+                    if self.ser and self.ser.in_waiting > 0:
+                        data = self.ser.read(self.ser.in_waiting)
+                        
+                        # Add to buffer
+                        self.rx_buffer.extend(data)
+                        
+                        # Process complete frames from buffer
+                        self.process_rx_buffer()
+                    
+                    time.sleep(0.1)  # Shorter sleep for better responsiveness
+                    
+            else:
+                self.after(0, self.stop_monitoring)
+                
+        except Exception as e:
+            self.after(0, self.log_event, f"Monitoring error: {str(e)}", "ERROR")
+            self.after(0, self.stop_monitoring)
+    
+    def process_rx_buffer(self):
+        """Process complete frames from receive buffer"""
+        while len(self.rx_buffer) >= 12:  # Minimum frame size
+            # Look for sync byte as frame delimiter
+            sync_pos = -1
+            for i in range(len(self.rx_buffer)):
+                if self.rx_buffer[i] == self.SYNC_BYTE and i >= 11:
+                    sync_pos = i
+                    break
+            
+            if sync_pos == -1:
+                break  # No complete frame found
+            
+            # Extract frame (from beginning to sync byte inclusive)
+            frame_data = bytes(self.rx_buffer[:sync_pos+1])
+            self.rx_buffer = self.rx_buffer[sync_pos+1:]
+            
+            # Parse the frame
+            frame_info, status = self.parse_modbus_frame(frame_data)
+            
+            if frame_info:
+                hex_response = ' '.join([f"{b:02X}" for b in frame_data])
+                
+                # Handle different function codes
+                fc = frame_info['function_code']
+                if fc == 0x20:  # eBtnIRQ - auto send button status
+                    self.log_event(f"🔄 AUTO: Button IRQ received", "SUCCESS")
+                    self.log_event(f"   Data: {hex_response}", "INFO")
+                    self.log_event(f"   Button status: {frame_info['data_bytes'].hex().upper()}", "INFO")
+                elif fc >= 0x40:  # Response to our commands
+                    # Find which command this responds to (you might want to track this better)
+                    self.log_event(f"📥 Response FC=0x{fc:02X} received", "INFO")
+                    self.log_event(f"   Data: {hex_response}", "INFO")
+                else:
+                    self.log_event(f"📥 Unknown frame FC=0x{fc:02X}", "WARNING")
+                    self.log_event(f"   Raw: {hex_response}", "INFO")
+            else:
+                hex_response = ' '.join([f"{b:02X}" for b in frame_data])
+                self.log_event(f"❌ INVALID FRAME: {status}", "ERROR")
+                self.log_event(f"   Raw: {hex_response}", "INFO")
+    
+    # ========== SETTINGS METHODS ==========
+    
+    def show_settings(self):
+        """Show settings dialog"""
+        settings = ctk.CTkToplevel(self)
+        settings.title("QTM Device Settings")
+        settings.geometry("400x500")
+        settings.resizable(False, False)
+        settings.transient(self)
+        settings.grab_set()
+        
+        # Center the settings window
+        self.center_child_window(settings)
+        
+        # Main frame
+        main_frame = ctk.CTkFrame(settings)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Title
+        ctk.CTkLabel(main_frame, text="QTM Device Settings", 
+                    font=ctk.CTkFont(size=20, weight="bold")).pack(pady=20)
+        
+        # Settings content frame
+        content_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        content_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # Get available ports
+        available_ports = self.get_available_ports()
+        
+        # COM Port setting
+        com_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        com_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(com_frame, text="COM Port:", 
+                    font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
+        
+        com_combo = ctk.CTkComboBox(com_frame, 
+                                   values=available_ports,
+                                   width=200,
+                                   font=ctk.CTkFont(size=12))
+        com_combo.pack(anchor="w", pady=(5, 0))
+        com_combo.set(self.current_com_port)
+        
+        # Baud Rate setting
+        baud_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        baud_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(baud_frame, text="Baud Rate:", 
+                    font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
+        
+        baud_combo = ctk.CTkComboBox(baud_frame, 
+                                    values=["9600", "19200", "38400", "115200"],
+                                    width=200,
+                                    font=ctk.CTkFont(size=12))
+        baud_combo.pack(anchor="w", pady=(5, 0))
+        baud_combo.set(str(self.current_baud_rate))
+        
+        # Board Address setting
+        addr_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        addr_frame.pack(fill="x", pady=10)
+        
+        ctk.CTkLabel(addr_frame, text="Board Address (Hex):", 
+                    font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w")
+        
+        addr_entry = ctk.CTkEntry(addr_frame, 
+                                 width=200,
+                                 placeholder_text="E1",
+                                 font=ctk.CTkFont(size=12))
+        addr_entry.pack(anchor="w", pady=(5, 0))
+        addr_entry.insert(0, f"{self.BOARD_ADDRESS:02X}")
+        
+        # Help text
+        help_label = ctk.CTkLabel(content_frame, 
+                                 text="Use 'DEBUG CONNECTION' to automatically find settings",
+                                 font=ctk.CTkFont(size=12),
+                                 text_color="gray")
+        help_label.pack(pady=(20, 10))
+        
+        # Buttons frame
+        button_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=20)
+        
+        # Save button
+        save_btn = ctk.CTkButton(button_frame, 
+                                text="Save Settings",
+                                command=lambda: self.save_settings(
+                                    com_combo.get(),
+                                    baud_combo.get(),
+                                    addr_entry.get()
+                                ),
+                                font=ctk.CTkFont(size=14, weight="bold"),
+                                height=40,
+                                fg_color="#2E7D32",
+                                hover_color="#1B5E20")
+        save_btn.pack(side="left", padx=(0, 10))
+        
+        # Cancel button
+        cancel_btn = ctk.CTkButton(button_frame, 
+                                  text="Cancel",
+                                  command=settings.destroy,
+                                  font=ctk.CTkFont(size=14),
+                                  height=40,
+                                  fg_color="#757575",
+                                  hover_color="#616161")
+        cancel_btn.pack(side="left")
+        
+        settings.focus_set()
+
+    def center_child_window(self, child_window):
+        """Center a child window relative to the main window"""
+        child_window.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - child_window.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - child_window.winfo_height()) // 2
+        child_window.geometry(f"+{x}+{y}")
+
+    def get_available_ports(self):
+        """Get list of available COM ports"""
+        try:
+            ports = serial.tools.list_ports.comports()
+            port_list = ["Auto Detect"]
+            for port in ports:
+                port_list.append(port.device)
+            return port_list
+        except Exception as e:
+            self.log_event(f"Error getting COM ports: {str(e)}", "ERROR")
+            return ["Auto Detect", "COM1", "COM2", "COM3", "COM4"]
+
+    def save_settings(self, com_port, baud_rate, board_addr):
+        """Save settings with passed parameters"""
+        try:
+            self.current_com_port = com_port
+            self.current_baud_rate = int(baud_rate)
+            
+            if board_addr.upper().startswith('0X'):
+                self.BOARD_ADDRESS = int(board_addr, 16)
+            else:
+                self.BOARD_ADDRESS = int(board_addr, 16)
+            
+            # Close the settings window
+            for widget in self.winfo_children():
+                if isinstance(widget, ctk.CTkToplevel):
+                    widget.destroy()
+            
+            self.log_event(f"Settings saved - COM: {com_port}, Baud: {baud_rate}, Board: 0x{self.BOARD_ADDRESS:02X}", "SUCCESS")
+            
+        except Exception as e:
+            self.log_event(f"Error saving settings: {str(e)}", "ERROR")
+
+    def refresh_com_ports(self):
+        """Refresh available COM ports list"""
+        self.log_event("Refreshing available COM ports...", "INFO")
+        
+        try:
+            ports = serial.tools.list_ports.comports()
+            if not ports:
+                self.log_event("No COM ports found on system", "WARNING")
+            else:
+                port_list = [port.device for port in ports]
+                self.log_event(f"Found {len(ports)} COM port(s): {', '.join(port_list)}", "INFO")
+                    
+        except Exception as e:
+            self.log_event(f"Error refreshing COM ports: {str(e)}", "ERROR")
+
+if __name__ == "__main__":
+    app = QTMOrchestrator()
+    app.mainloop()
