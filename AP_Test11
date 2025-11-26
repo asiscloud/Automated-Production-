@@ -1,0 +1,2789 @@
+from optparse import Values
+import customtkinter as ctk
+import sys
+from pymodbus.client import ModbusSerialClient
+import threading
+import pymodbus
+from datetime import datetime
+import serial  
+import time    
+from PIL import Image
+import os
+import logging
+import traceback
+import struct
+import subprocess
+import shutil
+
+# Set appearance
+ctk.set_appearance_mode("Dark")  # "Dark", "Light", "System"
+ctk.set_default_color_theme("blue")  # "blue", "green", "dark-blue"
+
+# -------------------------------
+# STM32 Programmer Class using pystlink - ENHANCED WITH J-LINK SUPPORT
+# -------------------------------
+class STM32Programmer:
+    def __init__(self, log_callback=None):
+        self.log_callback = log_callback
+        self.stlink_connected = False
+        self.jlink_connected = False  # NEW: J-Link connection status
+        self.current_stlink_method = None
+        
+    def log(self, message, level="INFO"):
+        """Log message through callback"""
+        if self.log_callback:
+            self.log_callback(message, level)
+        else:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{timestamp}] {level}: {message}")
+    
+    def detect_stlink(self):
+        """Detect connected STLink devices using pystlink"""
+        try:
+            # Try to import pystlink
+            try:
+                import pystlink
+                self.log("✅ pystlink library available", "SUCCESS")
+            except ImportError:
+                self.log("❌ pystlink not installed. Please run: pip install pystlink", "ERROR")
+                return False, []
+            
+            self.log("🔍 Scanning for STLink devices...", "INFO")
+            
+            try:
+                # Use pystlink to detect STLinks
+                stlinks = pystlink.Stlink().list_stlinks()
+                
+                if stlinks:
+                    self.log(f"✅ Found {len(stlinks)} STLink device(s) using pystlink", "SUCCESS")
+                    stlink_ports = []
+                    for i, stlink_info in enumerate(stlinks):
+                        port_info = f"STLink_{i+1}"
+                        stlink_ports.append((port_info, str(stlink_info)))
+                        self.log(f"   - {port_info}: {stlink_info}", "INFO")
+                    return True, stlink_ports
+                else:
+                    self.log("❌ No STLink devices found using pystlink", "WARNING")
+                    return False, []
+                    
+            except Exception as e:
+                self.log(f"❌ Error using pystlink detection: {e}", "ERROR")
+                return False, []
+                
+        except Exception as e:
+            self.log(f"❌ Error detecting STLink: {e}", "ERROR")
+            return False, []
+
+    # NEW: J-Link Detection Method
+    def detect_jlink(self):
+        """Detect J-Link devices and COM ports"""
+        try:
+            self.log("🔍 Scanning for J-Link devices...", "INFO")
+            
+            # Method 1: Check for J-Link executable
+            jlink_exe = self._find_jlink_executable()
+            if not jlink_exe:
+                self.log("❌ J-Link executable not found", "WARNING")
+                return False, []
+            
+            # Method 2: Check for J-Link CDC UART Port (COM3)
+            import serial.tools.list_ports
+            available_ports = serial.tools.list_ports.comports()
+            
+            jlink_ports = []
+            for port, desc, hwid in available_ports:
+                if 'JLink' in desc or 'CDC' in desc or port == 'COM3':
+                    jlink_ports.append((port, desc))
+                    self.log(f"✅ Found potential J-Link port: {port} - {desc}", "SUCCESS")
+            
+            if jlink_ports:
+                self.log(f"✅ Found {len(jlink_ports)} J-Link compatible port(s)", "SUCCESS")
+                return True, jlink_ports
+            else:
+                self.log("❌ No J-Link CDC UART ports found", "WARNING")
+                return False, []
+                
+        except Exception as e:
+            self.log(f"❌ Error detecting J-Link: {e}", "ERROR")
+            return False, []
+
+    # NEW: J-Link Programming Method
+    def program_with_jlink(self, firmware_path, address="0x08000000", device="STM32F103C8", 
+                        speed="4000", interface="SWD", serial_no=None):
+        """Program STM32 using J-Link with configurable settings"""
+        try:
+            if not os.path.exists(firmware_path):
+                return False, f"Firmware file not found: {firmware_path}"
+        
+            self.log(f"🔄 Programming with J-Link: {firmware_path} to {address}", "INFO")
+            self.log(f"   Device: {device}, Interface: {interface}, Speed: {speed} kHz", "INFO")
+            if serial_no:
+                self.log(f"   Serial Number: {serial_no}", "INFO")
+        
+            # Find J-Link executable
+            jlink_exe = self._find_jlink_executable()
+            if not jlink_exe:
+                return False, "J-Link executable not found"
+        
+            # Build J-Link command script with configurable parameters
+            script_lines = [
+                f"device {device}",
+                f"speed {speed}",
+                f"if {interface}",
+            ]
+        
+            # Add serial number if specified
+            if serial_no:
+                script_lines.append(f"usb {serial_no}")
+        
+            # Add programming commands
+            script_lines.extend([
+                "erase",
+                f"loadfile {firmware_path} {address}",
+                "r",
+                "q"
+            ])
+        
+            script_content = "\n".join(script_lines)
+        
+            # Write temporary script file
+            script_path = "jlink_script.jlink"
+            with open(script_path, 'w') as f:
+                f.write(script_content)
+        
+            # Build J-Link command
+            cmd = [jlink_exe, "-CommanderScript", script_path]
+        
+            self.log(f"🔧 Executing J-Link with configuration:", "INFO")
+            self.log(f"   Device: {device}", "INFO")
+            self.log(f"   Interface: {interface}", "INFO")
+            self.log(f"   Speed: {speed} kHz", "INFO")
+            if serial_no:
+                self.log(f"   Serial: {serial_no}", "INFO")
+            self.log(f"   Command: {' '.join(cmd)}", "INFO")
+        
+            # Run J-Link programming command
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+            # Clean up temporary script
+            try:
+                os.remove(script_path)
+            except:
+                pass
+        
+            # Enhanced output analysis
+            success_indicators = [
+                "Programming performed",
+                "O.K.",
+                "Verify successful",
+                "Download successful",
+                "Erase done",
+                "Loading file",
+                "J-Link connected"
+            ]
+        
+            error_indicators = [
+                "ERROR",
+                "Failed",
+                "Can not connect",
+                "Communication failed",
+                "Unknown device",
+                "No J-Link found"
+            ]
+        
+            if result.returncode == 0:
+                output_lower = result.stdout.lower()
+                if any(indicator.lower() in output_lower for indicator in success_indicators):
+                    self.log("✅ J-Link programming completed successfully", "SUCCESS")
+                    return True, "J-Link programming successful"
+                elif any(indicator.lower() in output_lower for indicator in error_indicators):
+                    error_msg = f"J-Link reported errors: {result.stdout}"
+                    self.log(f"❌ {error_msg}", "ERROR")
+                    return False, error_msg
+                else:
+                    self.log("⚠️ J-Link completed but no clear success indicator", "WARNING")
+                    self.log(f"   Output: {result.stdout}", "INFO")
+                    return True, "J-Link completed with warnings"
+            else:
+                error_msg = f"J-Link failed: {result.stderr or result.stdout}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+            
+        except subprocess.TimeoutExpired:
+            error_msg = "J-Link programming timeout"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"J-Link programming error: {str(e)}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+
+    def _find_jlink_executable(self):
+        """Find J-Link executable"""
+        possible_paths = [
+            "JLink.exe",
+            "JLink",
+            "C:\\Program Files (x86)\\SEGGER\\JLink\\JLink.exe",
+            "C:\\Program Files\\SEGGER\\JLink\\JLink.exe",
+            "/usr/bin/JLinkExe"  # Linux path
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                self.log(f"✅ Found J-Link executable: {path}", "SUCCESS")
+                return path
+        
+        # Try to find in PATH
+        path = shutil.which("JLink")
+        if path:
+            self.log(f"✅ Found J-Link in PATH: {path}", "SUCCESS")
+            return path
+        
+        path = shutil.which("JLink.exe")
+        if path:
+            self.log(f"✅ Found JLink.exe in PATH: {path}", "SUCCESS")
+            return path
+            
+        self.log("❌ J-Link executable not found", "WARNING")
+        return None
+
+    def program_stm32(self, firmware_path, address=0x08000000, method="auto"):
+        """Program STM32 with firmware file - Enhanced auto-detection"""
+        try:
+            if not os.path.exists(firmware_path):
+                return False, f"Firmware file not found: {firmware_path}"
+        
+            self.log(f"🔄 Programming {firmware_path} to address {hex(address)}", "INFO")
+        
+            # Auto-detection logic
+            if method == "auto":
+                self.log("🔄 Auto-detecting best programming method...", "INFO")
+            
+                # 1. First try J-Link
+                self.log("🔍 Checking for J-Link...", "INFO")
+                jlink_detected, jlink_devices = self.detect_jlink()
+                if jlink_detected:
+                    self.log("🎯 J-Link detected - attempting programming...", "SUCCESS")
+                    for port, desc in jlink_devices:
+                        self.log(f"   Using {port}: {desc}", "INFO")
+                
+                    # Try J-Link with auto probe detection
+                    success, message = self.program_with_jlink_auto(firmware_path, hex(address))
+                    if success:
+                        return True, message
+                    else:
+                        self.log("❌ J-Link programming failed, trying next method...", "WARNING")
+            
+                # 2. Then try pystlink (ST-Link)
+                self.log("🔍 Checking for ST-Link (pystlink)...", "INFO")
+                try:
+                    import pystlink
+                    stlink_detected, stlink_devices = self.detect_stlink()
+                    if stlink_detected:
+                        self.log("🎯 ST-Link detected - attempting programming...", "SUCCESS")
+                        success, message = self._program_with_pystlink(firmware_path, address)
+                        if success:
+                            return True, message
+                        else:
+                            self.log("❌ ST-Link programming failed, trying fallback...", "WARNING")
+                except ImportError:
+                    self.log("❌ pystlink not available, skipping...", "WARNING")
+            
+                # 3. Finally try STM32CubeProgrammer fallback with auto probe detection
+                self.log("🔍 Trying STM32CubeProgrammer fallback...", "INFO")
+                success, message = self.program_stm32_fallback_auto(firmware_path, address)
+                return success, message
+                
+            else:
+                # Manual method selection (for backward compatibility)
+                if method == "jlink":
+                    return self.program_with_jlink_auto(firmware_path, hex(address))
+                elif method == "pystlink":
+                    return self._program_with_pystlink(firmware_path, address)
+                elif method == "fallback":
+                    return self.program_stm32_fallback_auto(firmware_path, address)
+                else:
+                    return False, f"Unknown programming method: {method}"
+                
+        except Exception as e:
+            error_msg = f"Programming error: {str(e)}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+
+    def _program_with_pystlink(self, firmware_path, address=0x08000000):
+        """Internal method for pystlink programming"""
+        try:
+            import pystlink
+            
+            with pystlink.Stlink() as stlink:
+                stlinks = stlink.list_stlinks()
+                if not stlinks:
+                    return False, "No STLink devices found"
+            
+                self.log(f"✅ Connected to STLink: {stlinks[0]}", "SUCCESS")
+            
+                try:
+                    core_id = stlink.get_core_id()
+                    self.log(f"📋 Chip Core ID: {hex(core_id)}", "INFO")
+                except Exception as e:
+                    self.log(f"⚠️ Could not read core ID: {e}", "WARNING")
+            
+                self.log("📤 Programming firmware...", "INFO")
+                stlink.program(firmware_path, address)
+            
+                self.log("🔍 Verifying programming...", "INFO")
+                stlink.reset()
+                self.log("🔄 Chip reset and running", "SUCCESS")
+            
+                self.log("✅ STM32 programming completed successfully using pystlink", "SUCCESS")
+                return True, "Programming successful"
+            
+        except Exception as e:
+            error_msg = f"pystlink programming error: {str(e)}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+
+    def program_stm32_fallback(self, firmware_path, address=0x08000000, probe_type="JLINK", 
+                          serial_no=None, frequency="4000"):
+        """Fallback method using STM32CubeProgrammer with J-Link configuration"""
+        try:
+            if not os.path.exists(firmware_path):
+                return False, f"Firmware file not found: {firmware_path}"
+    
+            self.log(f"🔄 Trying STM32CubeProgrammer with {probe_type}...", "INFO")
+    
+            # Find STM32CubeProgrammer
+            cube_prog = self._find_cubeprogrammer()
+            if not cube_prog:
+                return False, "STM32CubeProgrammer not found"
+    
+            # Build command based on probe type with J-Link configuration
+            if probe_type.upper() == "JLINK":
+                # J-Link specific command with configuration
+                cmd_base = [
+                    cube_prog,
+                    "-c", f"port=SWD", f"mode=UR", f"reset=HWrst", f"probe=JLINK",
+                ]
+        
+                # Add frequency configuration
+                if frequency:
+                    cmd_base.extend([f"freq={frequency}"])
+        
+                # Add serial number if specified
+                if serial_no:
+                    cmd_base.extend([f"sn={serial_no}"])
+        
+                # Add programming commands
+                cmd = cmd_base + [
+                    "-w", firmware_path, hex(address),
+                    "-v",  # Verify
+                    "-s",   # Reset and run
+                    "-hardRst"
+                ]
+            else:
+                # Default ST-Link command
+                cmd = [
+                    cube_prog,
+                    "-c", "port=SWD", "mode=UR", "reset=HWrst",
+                    "-w", firmware_path, hex(address),
+                    "-v",  # Verify
+                    "-s",   # Reset and run
+                    "-hardRst"
+                ]
+    
+            self.log(f"🔧 Executing STM32CubeProgrammer with {probe_type}...", "INFO")
+            self.log(f"   Command: {' '.join(cmd)}", "INFO")
+            if probe_type.upper() == "JLINK":
+                self.log(f"   Frequency: {frequency} kHz", "INFO")
+                if serial_no:
+                    self.log(f"   Serial Number: {serial_no}", "INFO")
+    
+            # Run programming command
+            try:
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=60,
+                    shell=False,
+                    cwd=os.path.dirname(cube_prog)
+                )
+            except subprocess.TimeoutExpired:
+                error_msg = f"STM32CubeProgrammer timeout - check {probe_type} connection"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+            except Exception as e:
+                error_msg = f"Failed to execute STM32CubeProgrammer: {e}"
+                self.log(f"❌ {error_msg}", "ERROR")
+                return False, error_msg
+    
+            # Analyze output
+            combined_output = result.stdout + result.stderr
+    
+            if result.returncode == 0:
+                success_indicators = [
+                    "Programming complete",
+                    "File download complete", 
+                    "Download verified successfully",
+                    "Verification...OK",
+                ]
+        
+                if any(indicator.lower() in combined_output.lower() for indicator in success_indicators):
+                    self.log(f"✅ STM32 programming completed successfully with {probe_type}", "SUCCESS")
+                    return True, f"Programming successful with {probe_type}"
+                else:
+                    self.log("⚠️ STM32CubeProgrammer completed but no clear success message", "WARNING")
+                    return True, "Programming completed"
+    
+            else:
+                # Enhanced error analysis
+                if "No debug probe detected" in combined_output:
+                    error_msg = f"No {probe_type} probe detected - check connection and drivers"
+                elif "can't connect" in combined_output.lower():
+                    error_msg = f"Cannot connect to {probe_type} - check physical connection"
+                elif "error" in combined_output.lower():
+                    error_lines = [line for line in combined_output.split('\n') if 'error' in line.lower()]
+                    error_msg = error_lines[0] if error_lines else f"{probe_type} connection error"
+                else:
+                    error_msg = f"{probe_type} programming failed"
+        
+                self.log(f"❌ {error_msg}", "ERROR")
+                if combined_output.strip():
+                    self.log(f"   Output: {combined_output}", "ERROR")
+                return False, error_msg
+        
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+
+    def _find_cubeprogrammer(self):
+        """Find STM32CubeProgrammer CLI executable (for fallback)"""
+        possible_paths = [
+            "STM32_Programmer_CLI.exe",
+            "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+            "C:\\Program Files (x86)\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+            "STM32_Programmer_CLI"  # If in PATH
+        ]
+    
+        for path in possible_paths:
+            if os.path.exists(path):
+                self.log(f"✅ Found STM32CubeProgrammer: {path}", "SUCCESS")
+                return path
+    
+        # Try to find in PATH
+        path = shutil.which("STM32_Programmer_CLI")
+        if path:
+            self.log(f"✅ Found STM32CubeProgrammer in PATH: {path}", "SUCCESS")
+            return path
+    
+        self.log("❌ STM32CubeProgrammer not found", "ERROR")
+        return None
+
+    def diagnose_cubeprogrammer(self):
+        """Run comprehensive diagnostics on STM32CubeProgrammer"""
+        try:
+            self.log("🔧 Running STM32CubeProgrammer diagnostics...", "INFO")
+    
+            # Check if executable exists
+            cube_prog = self._find_cubeprogrammer()
+            if not cube_prog:
+                return False, "STM32CubeProgrammer not found"
+    
+            self.log(f"✅ Found STM32CubeProgrammer: {cube_prog}", "SUCCESS")
+    
+            # Test basic help command
+            help_cmd = [cube_prog, "--help"]
+            self.log("🔧 Testing basic help command...", "INFO")
+    
+            try:
+                help_result = subprocess.run(
+                    help_cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=10,
+                    shell=False
+                )
+        
+                if help_result.returncode == 0 and "STM32_Programmer_CLI" in help_result.stdout:
+                    self.log("✅ STM32CubeProgrammer help command works", "SUCCESS")
+                else:
+                    self.log("❌ STM32CubeProgrammer help command failed", "ERROR")
+                    return False, "STM32CubeProgrammer not functioning properly"
+            
+            except Exception as e:
+                self.log(f"❌ Help command failed: {e}", "ERROR")
+                return False, f"STM32CubeProgrammer execution failed: {e}"
+    
+            # Test connection to ST-Link
+            connect_cmd = [cube_prog, "-c", "port=SWD", "-l"]
+            self.log("🔧 Testing ST-Link connection...", "INFO")
+    
+            try:
+                connect_result = subprocess.run(
+                    connect_cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    timeout=15,
+                    shell=False
+                )
+        
+                if connect_result.returncode == 0:
+                    if "ST-LINK" in connect_result.stdout:
+                        self.log("✅ ST-Link detected successfully", "SUCCESS")
+                        return True, "STM32CubeProgrammer is working correctly"
+                    else:
+                        self.log("⚠️ STM32CubeProgrammer connected but no ST-Link found", "WARNING")
+                        return False, "No ST-Link device detected"
+                else:
+                    self.log("❌ ST-Link connection test failed", "ERROR")
+                    self.log(f"   Error output: {connect_result.stderr}", "ERROR")
+                    return False, "ST-Link connection failed"
+            
+            except subprocess.TimeoutExpired:
+                self.log("❌ ST-Link connection test timeout", "ERROR")
+                return False, "ST-Link connection timeout"
+            except Exception as e:
+                self.log(f"❌ ST-Link connection test error: {e}", "ERROR")
+                return False, f"Connection test error: {e}"
+        
+        except Exception as e:
+            error_msg = f"Diagnostic error: {str(e)}"
+            self.log(f"❌ {error_msg}", "ERROR")
+            return False, error_msg
+
+    def program_with_jlink_auto(self, firmware_path, address="0x08000000"):
+        """Program with J-Link using auto-detected settings"""
+        # Auto-detect device type (you can modify this based on your common devices)
+        device = "STM32F103C8"  # Default, you can add detection logic if needed
+    
+        # Use default settings: SWD, 4000 kHz, auto serial number
+        return self.program_with_jlink(
+            firmware_path, 
+            address=address,
+            device=device,
+            interface="SWD",
+            speed="4000",
+            serial_no=None  # Auto-detect serial number
+        )
+
+    def program_stm32_fallback_auto(self, firmware_path, address=0x08000000):
+        """Fallback programming with auto probe detection"""
+        # First try J-Link probe
+        jlink_detected, _ = self.detect_jlink()
+        if jlink_detected:
+            self.log("🔍 J-Link detected for STM32CubeProgrammer", "INFO")
+            return self.program_stm32_fallback(
+                firmware_path, 
+                address=address,
+                probe_type="JLINK",
+                serial_no=None,  # Auto-detect
+                frequency="4000"
+            )
+        else:
+            # Fall back to ST-Link
+            self.log("🔍 Using ST-Link for STM32CubeProgrammer", "INFO")
+            return self.program_stm32_fallback(
+                firmware_path, 
+                address=address,
+                probe_type="STLINK"
+            )
+
+# -------------------------------
+# QTM Configuration Class
+# -------------------------------
+class QTMConfig:
+    PORT = 'COM8'  # Default COM for QTM
+    BAUDRATE = 9600
+    TIMEOUT = 1
+    WRITE_TIMEOUT = 1
+    
+    # Modbus Function Codes from FORTH
+    ePoll = 0x30
+    eAck = 0x40
+    eBtnURD = 0x31
+    eBtnDta = 0x41
+    eInCrd = 0x32
+    eInCdta = 0x42
+    eRelWr = 0x33
+    eRelAck = 0x43
+    eA2Drd = 0x34
+    eA2Ddta = 0x44
+    eBtnIRQ = 0x20
+    
+    # Protocol Constants
+    ePOSTHDR = 0xAA
+    eQTM_ADR = 0xE1
+    eASISPROTOCOL = 0x60
+    
+    # QTM ID mappings with different function codes
+    QTM_ID = {        
+        "E1": "00 01 00 60 00 08 E1 31 11 22 01 AE 0C AA",  # Button Read
+        "E2": "00 01 00 60 00 08 E2 31 11 22 01 AE 0C AB",
+        "E3": "00 01 00 60 00 08 E3 31 11 22 01 AE 0C AC",
+        "E4": "00 01 00 60 00 08 E4 31 11 22 01 AE 0C AD"
+    }
+
+    # Default QTM ID
+    DEFAULT_QTM_ID = "E1"
+    
+    # Current frame hex (initialize with default)
+    FRAME_HEX = QTM_ID[DEFAULT_QTM_ID]
+    
+    # Status mapping table - ADDED AS REQUESTED
+    STATUS_MAPPING = {
+        "44 08 08 00 53 27 80": "Power Up",
+        "44 00 00 00 53 17 80": "No Trigger", 
+        "44 10 10 00 53 37 80": "Red Line Triggered",
+        "44 20 20 00 53 57 80": "Grn Line Triggered",
+        "44 30 30 00 53 77 80": "Buz Line Triggered",
+        "44 40 40 00 53 17 80": "Hold Line Triggered"
+    }
+    
+    @classmethod
+    def get_frame(cls):
+        """Convert hex string to bytes, removing spaces"""
+        return bytes.fromhex(cls.FRAME_HEX.replace(' ', ''))
+    
+    @classmethod
+    def get_qtm_id_from_frame(cls, frame_hex):
+        """Extract QTM ID from frame hex (reverse lookup)"""
+        try:
+            normalized_input = frame_hex.replace(' ', '')
+            for qtm_id, hex_value in cls.QTM_ID.items():
+                normalized_hex = hex_value.replace(' ', '')
+                if normalized_input == normalized_hex:
+                    return qtm_id
+            return cls.DEFAULT_QTM_ID
+        except Exception as e:
+            print(f"Error in get_qtm_id_from_frame: {e}")
+            return cls.DEFAULT_QTM_ID
+
+    @classmethod
+    def get_main_status_from_data_flow(cls, data_flow_hex):
+        """Get Main Status from Data Flow hex string - ADDED AS REQUESTED"""
+        try:
+            # Normalize the input by removing spaces and converting to uppercase
+            normalized_flow = data_flow_hex.replace(' ', '').upper()
+            
+            # Check each status pattern
+            for flow_hex, status in cls.STATUS_MAPPING.items():
+                normalized_pattern = flow_hex.replace(' ', '').upper()
+                if normalized_flow == normalized_pattern:
+                    return status
+            
+            # If no exact match found, return default status
+            return "Unknown Status"
+        except Exception as e:
+            print(f"Error in get_main_status_from_data_flow: {e}")
+            return "Status Error"
+
+# -------------------------------
+# QTM Communication Class with FORTH Functions
+# -------------------------------
+class QTMCommunicator:
+    def __init__(self, config, log_callback=None):
+        self.config = config
+        self.log_callback = log_callback
+        self.ser = None
+        self.ser_COM9 = None  # Additional connection for COM9
+        self.ser_com3 = None  # Additional connection for COM3 (STLink)
+        self.ser_usb = None   # NEW: USB connection for STLink
+        self.is_connected = False
+        self.is_COM9_connected = False
+        self.is_com3_connected = False  # COM3 connection status
+        self.is_usb_connected = False   # NEW: USB connection status
+        self.listening_active = False
+        self.transaction_id = 1  # Starting transaction ID
+        
+        # Initialize STM32 Programmer with pystlink
+        self.stm32_programmer = STM32Programmer(log_callback)
+        
+    def log(self, message, level="INFO"):
+        """Log message through callback"""
+        if self.log_callback:
+            self.log_callback(message, level)
+        else:
+            # Fallback logging if callback not set
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            print(f"[{timestamp}] {level}: {message}")
+    
+    def calculate_checksum(self, data):
+        """Calculate checksum for Modbus TCP frame"""
+        checksum = 0
+        for byte in data:
+            checksum = (checksum + byte) & 0xFFFF
+        return checksum
+    
+    def build_modbus_frame(self, function_code, data_bytes=b''):
+        """Build Modbus TCP frame with ASIS protocol"""
+        # Transaction ID (increment for each new transaction)
+        tid = self.transaction_id
+        self.transaction_id = (self.transaction_id + 1) & 0xFFFF
+        
+        # Protocol ID (0x0060 for ASIS protocol)
+        pid = 0x0060
+        
+        # Length: Unit ID (1) + Function Code (1) + Data bytes + Checksum (2)
+        length = 1 + 1 + len(data_bytes) + 2
+        
+        # Build the frame
+        frame = bytearray()
+        frame.extend(struct.pack('>H', tid))      # Transaction ID
+        frame.extend(struct.pack('>H', pid))      # Protocol ID
+        frame.extend(struct.pack('>H', length))   # Length
+        frame.append(self.config.eQTM_ADR)        # Unit ID
+        frame.append(function_code)               # Function Code
+        frame.extend(data_bytes)                  # Data bytes
+        
+        # Calculate checksum
+        checksum = self.calculate_checksum(frame)
+        frame.extend(struct.pack('>H', checksum))
+        
+        # Add post header
+        frame.append(self.config.ePOSTHDR)
+        
+        return bytes(frame)
+    
+    # FORTH Function Implementations
+    
+    def send_poll(self):
+        """Send poll command (ePoll = 0x30)"""
+        # Poll command with filler data (0x11, 0x22)
+        data = bytes([0x11, 0x22])
+        return self.build_modbus_frame(self.config.ePoll, data)
+    
+    def send_button_read(self):
+        """Send button read command (eBtnURD = 0x31)"""
+        # Button read with filler data (0x11, 0x22)
+        data = bytes([0x11, 0x22])
+        return self.build_modbus_frame(self.config.eBtnURD, data)
+    
+    def send_relay1_on(self):
+        """Send R1 ON command with specific frame"""
+        # R1 ON: 00 01 00 60 00 08 E1 33 01 00 01 7E 0C AA
+        frame_hex = "00 01 00 60 00 08 E1 33 01 00 01 7E 0C AA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_relay2_on(self):
+        """Send R2 ON command with specific frame"""
+        # R2 ON: 00 01 00 60 00 08 E1 33 00 01 01 7E 0C AA
+        frame_hex = "00 01 00 60 00 08 E1 33 00 01 01 7E 0C AA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_relay1_off(self):
+        """Send R1 OFF command with specific frame"""
+        # R1 OFF: 00 01 00 60 00 08 E1 33 00 00 01 7D 0C AA
+        frame_hex = "00 01 00 60 00 08 E1 33 00 00 01 7D 0C AA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_relay2_off(self):
+        """Send R2 OFF command with specific frame"""
+        # R2 OFF: 00 01 00 60 00 08 E1 33 00 00 01 7D 0C AA
+        frame_hex = "00 01 00 60 00 08 E1 33 00 00 01 7D 0C AA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    # R1M and R2M functions
+    def send_r1m_on(self):
+        """Send R1M ON command: 01 05 00 00 FF 00 8C 3A"""
+        frame_hex = "01 05 00 00 FF 00 8C 3A"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r1m_off(self):
+        """Send R1M OFF command: 01 05 00 00 00 00 CD CA"""
+        frame_hex = "01 05 00 00 00 00 CD CA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r2m_on(self):
+        """Send R2M ON command: 01 05 00 01 FF 00 DD FA"""
+        frame_hex = "01 05 00 01 FF 00 DD FA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r2m_off(self):
+        """Send R2M OFF command: 01 05 00 01 00 00 9C 0A"""
+        frame_hex = "01 05 00 01 00 00 9C 0A"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    # R3M to R8M functions
+    def send_r3m_on(self):
+        """Send R3M ON command: 01 05 00 02 FF 00 2D FA"""
+        frame_hex = "01 05 00 02 FF 00 2D FA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r3m_off(self):
+        """Send R3M OFF command: 01 05 00 02 00 00 6C 0A"""
+        frame_hex = "01 05 00 02 00 00 6C 0A"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r4m_on(self):
+        """Send R4M ON command: 01 05 00 03 FF 00 7C 3A"""
+        frame_hex = "01 05 00 03 FF 00 7C 3A"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r4m_off(self):
+        """Send R4M OFF command: 01 05 00 03 00 00 3D CA"""
+        frame_hex = "01 05 00 03 00 00 3D CA"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r5m_on(self):
+        """Send R5M ON command: 01 05 00 04 FF 00 CD FB"""
+        frame_hex = "01 05 00 04 FF 00 CD FB"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r5m_off(self):
+        """Send R5M OFF command: 01 05 00 04 00 00 8C 0B"""
+        frame_hex = "01 05 00 04 00 00 8C 0B"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r6m_on(self):
+        """Send R6M ON command: 01 05 00 05 FF 00 9C 3B"""
+        frame_hex = "01 05 00 05 FF 00 9C 3B"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r6m_off(self):
+        """Send R6M OFF command: 01 05 00 05 00 00 DD CB"""
+        frame_hex = "01 05 00 05 00 00 DD CB"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r7m_on(self):
+        """Send R7M ON command: 01 05 00 06 FF 00 6C 3B"""
+        frame_hex = "01 05 00 06 FF 00 6C 3B"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r7m_off(self):
+        """Send R7M OFF command: 01 05 00 06 00 00 2D CB"""
+        frame_hex = "01 05 00 06 00 00 2D CB"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r8m_on(self):
+        """Send R8M ON command: 01 05 00 07 FF 00 3D FB"""
+        frame_hex = "01 05 00 07 FF 00 3D FB"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_r8m_off(self):
+        """Send R8M OFF command: 01 05 00 07 00 00 7C 0B"""
+        frame_hex = "01 05 00 07 00 00 7C 0B"
+        return bytes.fromhex(frame_hex.replace(' ', ''))
+    
+    def send_input_capture_read(self):
+        """Send input capture read command (eInCrd = 0x32)"""
+        # Input capture read with filler data (0x11, 0x22)
+        data = bytes([0x11, 0x22])
+        return self.build_modbus_frame(self.config.eInCrd, data)
+    
+    def send_adc_read(self):
+        """Send ADC read command (eA2Drd = 0x34)"""
+        # ADC read with filler data (0x11, 0x22)
+        data = bytes([0x11, 0x22])
+        return self.build_modbus_frame(self.config.eA2Drd, data)
+    
+    def send_button_irq(self, button_data):
+        """Send button IRQ (auto-send when button pressed) (eBtnIRQ = 0x20)"""
+        # Button IRQ with button state data
+        data = bytes([0x00, button_data])  # Format: 0x00, button_state
+        return self.build_modbus_frame(self.config.eBtnIRQ, data)
+    
+    def parse_modbus_response(self, response):
+        """Parse Modbus TCP response frame"""
+        try:
+            if len(response) < 12:  # Minimum frame size
+                return None
+            
+            # Parse frame structure
+            tid = struct.unpack('>H', response[0:2])[0]
+            pid = struct.unpack('>H', response[2:4])[0]
+            length = struct.unpack('>H', response[4:6])[0]
+            unit_id = response[6]
+            function_code = response[7]
+            
+            # Extract data based on function code
+            data = response[8:-3]  # Exclude checksum and post header
+            
+            return {
+                'transaction_id': tid,
+                'protocol_id': pid,
+                'length': length,
+                'unit_id': unit_id,
+                'function_code': function_code,
+                'data': data,
+                'raw_response': response
+            }
+        except Exception as e:
+            self.log(f"Error parsing Modbus response: {e}", "ERROR")
+            return None
+    
+    def process_function_code(self, parsed_frame):
+        """Process incoming frames based on function code"""
+        if not parsed_frame:
+            return
+        
+        fc = parsed_frame['function_code']
+        data = parsed_frame['data']
+        
+        if fc == self.config.eAck:  # 0x40 - Poll ACK
+            if data:
+                version = data.decode('ascii', errors='ignore')
+                self.log(f"📋 Firmware Version: {version}", "SUCCESS")
+                return f"FIRMWARE:{version}"
+                
+        elif fc == self.config.eBtnDta:  # 0x41 - Button Data
+            if len(data) >= 2:
+                button_state = data[1]  # Second byte contains button state
+                self.log(f"🔘 Button State: 0x{button_state:02X}", "SUCCESS")
+                return f"BUTTONS:{button_state:02X}"
+                
+        elif fc == self.config.eRelAck:  # 0x43 - Relay ACK
+            if len(data) >= 2:
+                relay1 = data[0]
+                relay2 = data[1]
+                self.log(f"🔌 Relay States - R1: {relay1}, R2: {relay2}", "SUCCESS")
+                return f"RELAYS:{relay1}:{relay2}"
+                
+        elif fc == self.config.eInCdta:  # 0x42 - Input Capture Data
+            if len(data) >= 2:
+                input1 = data[0]
+                input2 = data[1]
+                self.log(f"📥 Input Capture - IN1: 0x{input1:02X}, IN2: 0x{input2:02X}", "SUCCESS")
+                return f"INPUTS:{input1:02X}:{input2:02X}"
+                
+        elif fc == self.config.eA2Ddta:  # 0x44 - ADC Data
+            if len(data) >= 6:
+                # Assuming 3 ADC channels, 2 bytes each
+                adc_values = []
+                for i in range(0, 6, 2):
+                    if i+1 < len(data):
+                        value = (data[i] << 8) | data[i+1]
+                        adc_values.append(value)
+                self.log(f"📊 ADC Values: {adc_values}", "SUCCESS")
+                return f"ADC:{adc_values}"
+                
+        elif fc == self.config.eBtnIRQ:  # 0x20 - Button IRQ
+            if len(data) >= 2:
+                button_irq = data[1]
+                self.log(f"🚨 Button IRQ Detected: 0x{button_irq:02X}", "WARNING")
+                return f"IRQ:{button_irq:02X}"
+        
+        return None
+
+    def connect(self, port=None, baudrate=None):
+        """Establish serial connection to QTM with better error handling"""
+        try:
+            conn_port = port or self.config.PORT
+            conn_baudrate = baudrate or self.config.BAUDRATE
+            
+            self.log(f"🔌 Attempting to connect to {conn_port} at {conn_baudrate} baud", "INFO")
+            
+            # Close existing connection if any
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+                time.sleep(1)
+            
+            self.ser = serial.Serial(
+                port=conn_port,
+                baudrate=conn_baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.config.TIMEOUT,
+                write_timeout=self.config.WRITE_TIMEOUT
+            )
+            
+            # Wait for port to be ready
+            time.sleep(2)
+            
+            if self.ser.is_open:
+                self.is_connected = True
+                self.log(f"✅ Connected to {conn_port} at {conn_baudrate} baud", "SUCCESS")
+                return True
+            else:
+                self.log("❌ Serial port failed to open", "ERROR")
+                return False
+                
+        except serial.SerialException as e:
+            error_msg = str(e)
+            if "PermissionError" in error_msg or "Access is denied" in error_msg:
+                self.log(f"❌ Access denied to {conn_port}. Port may be in use by another application.", "ERROR")
+                self.log("💡 Please close any other applications using this COM port and try again.", "INFO")
+            else:
+                self.log(f"❌ Serial connection error: {e}", "ERROR")
+            return False
+        except Exception as e:
+            self.log(f"❌ Unexpected connection error: {e}", "ERROR")
+            return False
+
+    def connect_COM9(self, baudrate=9600):
+        """Establish additional connection to COM9"""
+        try:
+            self.log(f"🔌 Attempting to connect to COM9 at {baudrate} baud", "INFO")
+            
+            # Close existing COM9 connection if any
+            if self.ser_COM9 and self.ser_COM9.is_open:
+                self.ser_COM9.close()
+                time.sleep(1)
+            
+            self.ser_COM9 = serial.Serial(
+                port='COM9',
+                baudrate=baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.config.TIMEOUT,
+                write_timeout=self.config.WRITE_TIMEOUT
+            )
+            
+            # Wait for port to be ready
+            time.sleep(2)
+            
+            if self.ser_COM9.is_open:
+                self.is_COM9_connected = True
+                self.log(f"✅ Connected to COM9 at {baudrate} baud", "SUCCESS")
+                return True
+            else:
+                self.log("❌ COM9 port failed to open", "ERROR")
+                return False
+                
+        except serial.SerialException as e:
+            error_msg = str(e)
+            if "PermissionError" in error_msg or "Access is denied" in error_msg:
+                self.log(f"❌ Access denied to COM9. Port may be in use by another application.", "ERROR")
+                self.log("💡 Please close any other applications using COM9 and try again.", "INFO")
+            else:
+                self.log(f"❌ COM9 connection error: {e}", "ERROR")
+            return False
+        except Exception as e:
+            self.log(f"❌ Unexpected COM9 connection error: {e}", "ERROR")
+            return False
+
+    def connect_com3(self, baudrate=115200):
+        """Establish connection to COM3 for STLink Virtual COM Port"""
+        try:
+            self.log(f"🔌 Attempting to connect to COM3 (STLink) at {baudrate} baud", "INFO")
+            
+            # Close existing COM3 connection if any
+            if self.ser_com3 and self.ser_com3.is_open:
+                self.ser_com3.close()
+                time.sleep(1)
+            
+            self.ser_com3 = serial.Serial(
+                port='COM3',
+                baudrate=baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.config.TIMEOUT,
+                write_timeout=self.config.WRITE_TIMEOUT
+            )
+            
+            # Wait for port to be ready
+            time.sleep(2)
+            
+            if self.ser_com3.is_open:
+                self.is_com3_connected = True
+                self.log(f"✅ Connected to COM3 (STLink) at {baudrate} baud", "SUCCESS")
+                return True
+            else:
+                self.log("❌ COM3 port failed to open", "ERROR")
+                return False
+                
+        except serial.SerialException as e:
+            error_msg = str(e)
+            if "PermissionError" in error_msg or "Access is denied" in error_msg:
+                self.log(f"❌ Access denied to COM3. Port may be in use by another application.", "ERROR")
+                self.log("💡 Please close any other applications using COM3 and try again.", "INFO")
+            else:
+                self.log(f"❌ COM3 connection error: {e}", "ERROR")
+            return False
+        except Exception as e:
+            self.log(f"❌ Unexpected COM3 connection error: {e}", "ERROR")
+            return False
+
+    def connect_usb_stlink(self):
+        """NEW: Attempt to connect to STLink via USB (using STM32 Virtual COM Port)"""
+        try:
+            self.log("🔌 Attempting to detect STLink via USB...", "INFO")
+            
+            # Try common STLink Virtual COM Port names
+            usb_ports_to_try = [
+                'COM3',  # Common STLink COM port
+                'COM4',  # Alternative STLink COM port
+                'COM5',  # Another alternative
+                'COM6',  # Additional alternative
+            ]
+            
+            # Also try to auto-detect STLink by checking port descriptions
+            import serial.tools.list_ports
+            available_ports = serial.tools.list_ports.comports()
+            
+            stlink_ports = []
+            for port, desc, hwid in available_ports:
+                if 'STLink' in desc or 'STM32' in desc or 'ST-LINK' in desc:
+                    stlink_ports.append(port)
+                    self.log(f"🔍 Found potential STLink port: {port} - {desc}", "INFO")
+            
+            # Combine manual and auto-detected ports
+            all_ports_to_try = list(set(stlink_ports + usb_ports_to_try))
+            
+            for port in all_ports_to_try:
+                self.log(f"🔌 Trying STLink USB port: {port}", "INFO")
+                
+                try:
+                    # Close existing USB connection if any
+                    if self.ser_usb and self.ser_usb.is_open:
+                        self.ser_usb.close()
+                        time.sleep(1)
+                    
+                    self.ser_usb = serial.Serial(
+                        port=port,
+                        baudrate=115200,  # Common baud rate for STLink VCP
+                        bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE,
+                        timeout=self.config.TIMEOUT,
+                        write_timeout=self.config.WRITE_TIMEOUT
+                    )
+                    
+                    # Wait for port to be ready
+                    time.sleep(2)
+                    
+                    if self.ser_usb.is_open:
+                        # Test if it's actually an STLink by sending a simple command
+                        try:
+                            self.ser_usb.write(b'\n')  # Send newline to check responsiveness
+                            time.sleep(0.5)
+                            
+                            # If we can write without error, consider it connected
+                            self.is_usb_connected = True
+                            self.log(f"✅ Connected to STLink via USB ({port}) at 115200 baud", "SUCCESS")
+                            return True
+                            
+                        except Exception as test_error:
+                            self.log(f"⚠️ Port {port} opened but may not be STLink: {test_error}", "WARNING")
+                            self.ser_usb.close()
+                            continue
+                            
+                except serial.SerialException as e:
+                    self.log(f"❌ Failed to connect to {port}: {e}", "WARNING")
+                    continue
+                except Exception as e:
+                    self.log(f"❌ Unexpected error with {port}: {e}", "WARNING")
+                    continue
+            
+            self.log("❌ No STLink USB port found or accessible", "ERROR")
+            return False
+            
+        except Exception as e:
+            self.log(f"❌ USB STLink detection error: {str(e)}", "ERROR")
+            return False
+
+    def connect_all_ports(self):
+        """Connect to all required ports: COM8 (QTM), COM9 (Output), and either COM3 or USB (STLink)"""
+        try:
+            self.log("🔄 Starting multi-port connection sequence...", "INFO")
+            
+            connection_results = {
+                'COM8': False,
+                'COM9': False, 
+                'STLink': False  # Changed from COM3 to STLink (either COM3 or USB)
+            }
+            
+            # Connect to COM8 (QTM)
+            if self.connect('COM8', 9600):
+                connection_results['COM8'] = True
+                self.log("✅ COM8 (QTM) connected successfully", "SUCCESS")
+            else:
+                self.log("❌ Failed to connect to COM8 (QTM)", "ERROR")
+            
+            # Connect to COM9 (Output Module)
+            if self.connect_COM9(9600):
+                connection_results['COM9'] = True
+                self.log("✅ COM9 (Output Module) connected successfully", "SUCCESS")
+            else:
+                self.log("❌ Failed to connect to COM9 (Output Module)", "ERROR")
+            
+            # NEW: Try both COM3 and USB for STLink (priority to COM3 first)
+            stlink_connected = False
+            stlink_method = ""
+            
+            # First try COM3
+            if self.connect_com3(115200):
+                connection_results['STLink'] = True
+                stlink_connected = True
+                stlink_method = "COM3"
+                self.log("✅ STLink connected via COM3", "SUCCESS")
+            else:
+                self.log("❌ Failed to connect to STLink via COM3, trying USB...", "WARNING")
+                
+                # If COM3 fails, try USB
+                if self.connect_usb_stlink():
+                    connection_results['STLink'] = True
+                    stlink_connected = True
+                    stlink_method = "USB"
+                    self.log("✅ STLink connected via USB", "SUCCESS")
+                else:
+                    self.log("❌ Failed to connect to STLink via USB", "ERROR")
+            
+            # Summary
+            successful_connections = sum(connection_results.values())
+            total_connections = len(connection_results)
+            
+            self.log(f"📊 Connection Summary: {successful_connections}/{total_connections} ports connected", 
+                    "SUCCESS" if successful_connections > 0 else "WARNING")
+            
+            for port, status in connection_results.items():
+                status_text = "✅ Connected" if status else "❌ Failed"
+                if port == 'STLink' and status:
+                    status_text = f"✅ Connected via {stlink_method}"
+                self.log(f"   {port}: {status_text}", "INFO")
+            
+            return connection_results, stlink_method
+            
+        except Exception as e:
+            self.log(f"❌ Multi-port connection error: {str(e)}", "ERROR")
+            return {'COM8': False, 'COM9': False, 'STLink': False}, "None"
+
+    def send_frame(self, frame_data, retries=3, use_COM9=False, use_com3=False, use_usb=False):
+        """Send frame to QTM and read response"""
+        if use_usb:
+            # Send via USB (STLink)
+            if not self.ser_usb or not self.ser_usb.is_open:
+                self.log("❌ USB port not open", "ERROR")
+                return None
+            ser = self.ser_usb
+            port_name = "USB"
+        elif use_com3:
+            # Send via COM3 (STLink)
+            if not self.ser_com3 or not self.ser_com3.is_open:
+                self.log("❌ COM3 port not open", "ERROR")
+                return None
+            ser = self.ser_com3
+            port_name = "COM3"
+        elif use_COM9:
+            # Send via COM9
+            if not self.ser_COM9 and self.ser_COM9.is_open:
+                self.log("❌ COM9 port not open", "ERROR")
+                return None
+            ser = self.ser_COM9
+            port_name = "COM9"
+        else:
+            # Send via default port
+            if not self.ser or not self.ser.is_open:
+                self.log("❌ Serial port not open", "ERROR")
+                return None
+            ser = self.ser
+            port_name = "default"
+            
+        hex_frame = frame_data.hex(' ').upper()
+        self.log(f"📤 Sending frame via {port_name}: {hex_frame}", "INFO")
+        
+        for attempt in range(retries):
+            try:
+                self.log(f"🔄 Attempt {attempt + 1}/{retries}", "INFO")
+                
+                # Clear buffers
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                time.sleep(0.1)
+                
+                # Send frame
+                bytes_written = ser.write(frame_data)
+                ser.flush()
+                
+                self.log(f"✓ Bytes written: {bytes_written}", "INFO")
+                
+                # Wait for response
+                time.sleep(0.5)
+                
+                # Check if data is available
+                if ser.in_waiting > 0:
+                    response = ser.read(ser.in_waiting)
+                else:
+                    response = ser.read(128)
+                
+                if response:
+                    hex_resp = response.hex(' ').upper()
+                    self.log(f"📥 Response received from {port_name}: {hex_resp}", "SUCCESS")
+                    return response
+                else:
+                    self.log(f"⏳ No response received from {port_name}", "WARNING")
+                    
+            except serial.SerialTimeoutException:
+                self.log(f"⏰ Write timeout on attempt {attempt + 1}", "WARNING")
+            except serial.SerialException as e:
+                self.log(f"❌ Serial error on attempt {attempt + 1}: {e}", "ERROR")
+            except Exception as e:
+                self.log(f"❌ Unexpected error on attempt {attempt + 1}: {e}", "ERROR")
+            
+            if attempt < retries - 1:
+                time.sleep(1)
+        
+        self.log(f"❌ All communication attempts failed on {port_name}", "ERROR")
+        return None
+
+    def start_listening(self):
+        """Start listening for incoming data from QTM"""
+        self.listening_active = True
+        self.log("🎧 Started continuous listening for QTM data", "SUCCESS")
+    
+    def stop_listening(self):
+        """Stop listening for incoming data"""
+        self.listening_active = False
+        self.log("🛑 Stopped listening for QTM data", "INFO")
+    
+    def read_continuous_data(self):
+        """Continuously read incoming data from QTM"""
+        if not self.ser or not self.ser.is_open:
+            self.log("❌ Serial port not open", "ERROR")
+            return None
+        
+        while self.listening_active:
+            try:
+                if self.ser.in_waiting > 0:
+                    response = self.ser.read(self.ser.in_waiting)
+                    
+                    if response:
+                        hex_resp = response.hex(' ').upper()
+                        self.log(f"📥 Frame received: {hex_resp}", "SUCCESS")
+                        return response
+                
+                time.sleep(0.1)
+                
+            except serial.SerialException as e:
+                self.log(f"❌ Serial error while listening: {e}", "ERROR")
+                return None
+            except Exception as e:
+                self.log(f"❌ Unexpected error while listening: {e}", "ERROR")
+                return None
+        
+        return None
+    
+    def disconnect(self):
+        """Close all serial connections"""
+        self.stop_listening()
+        
+        # Close default connection
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+                self.is_connected = False
+                self.log("🔌 Default serial port closed", "INFO")
+            except Exception as e:
+                self.log(f"❌ Error closing default serial port: {e}", "ERROR")
+        
+        # Close COM9 connection
+        if self.ser_COM9 and self.ser_COM9.is_open:
+            try:
+                self.ser_COM9.close()
+                self.is_COM9_connected = False
+                self.log("🔌 COM9 serial port closed", "INFO")
+            except Exception as e:
+                self.log(f"❌ Error closing COM9 serial port: {e}", "ERROR")
+        
+        # Close COM3 connection
+        if self.ser_com3 and self.ser_com3.is_open:
+            try:
+                self.ser_com3.close()
+                self.is_com3_connected = False
+                self.log("🔌 COM3 (STLink) serial port closed", "INFO")
+            except Exception as e:
+                self.log(f"❌ Error closing COM3 serial port: {e}", "ERROR")
+        
+        # NEW: Close USB connection
+        if self.ser_usb and self.ser_usb.is_open:
+            try:
+                self.ser_usb.close()
+                self.is_usb_connected = False
+                self.log("🔌 USB (STLink) serial port closed", "INFO")
+            except Exception as e:
+                self.log(f"❌ Error closing USB serial port: {e}", "ERROR")
+
+    # STM32 Programming Methods using pystlink
+    def detect_stlink_devices(self):
+        """Detect STLink devices using pystlink"""
+        return self.stm32_programmer.detect_stlink()
+    
+    def program_stm32(self, firmware_path, stlink_method="auto"):
+        """Program STM32 chip using pystlink with fallback"""
+        self.log(f"🚀 Starting STM32 programming with pystlink...", "INFO")
+        
+        # First try pystlink
+        success, message = self.stm32_programmer.program_stm32(firmware_path)
+        
+        if not success:
+            self.log("⚠️ pystlink failed, trying fallback method...", "WARNING")
+            # Try fallback method
+            success, message = self.stm32_programmer.program_stm32_fallback(firmware_path)
+        
+        return success, message
+
+    def test_pystlink_connection(self):
+        """Test pystlink connection and capabilities"""
+        try:
+            import pystlink
+            self.log("✅ pystlink library imported successfully", "SUCCESS")
+            
+            stlinks = pystlink.Stlink().list_stlinks()
+            if stlinks:
+                self.log(f"✅ pystlink detected {len(stlinks)} STLink device(s)", "SUCCESS")
+                for i, stlink in enumerate(stlinks):
+                    self.log(f"   Device {i+1}: {stlink}", "INFO")
+                return True
+            else:
+                self.log("❌ pystlink found no STLink devices", "WARNING")
+                return False
+                
+        except ImportError:
+            self.log("❌ pystlink not installed. Please run: pip install pystlink", "ERROR")
+            return False
+        except Exception as e:
+            self.log(f"❌ pystlink test error: {e}", "ERROR")
+            return False
+
+    # NEW: J-Link specific methods
+    def detect_jlink_devices(self):
+        """Detect J-Link devices"""
+        return self.stm32_programmer.detect_jlink()
+
+    def program_with_jlink(self, firmware_path, device="STM32F103C8"):
+        """Program using J-Link specifically"""
+        self.log(f"🚀 Starting J-Link programming for device {device}...", "INFO")
+        return self.stm32_programmer.program_with_jlink(firmware_path, device=device)
+
+    # Enhanced programming method with J-Link support
+    def program_stm32_enhanced(self, firmware_path, method="auto"):
+        """Enhanced programming with J-Link support"""
+        self.log(f"🚀 Starting STM32 programming with method: {method}...", "INFO")
+        return self.stm32_programmer.program_stm32(firmware_path, method=method)
+    
+    def diagnose_cubeprogrammer(self):
+        """Run STM32CubeProgrammer diagnostics"""
+        return self.stm32_programmer.diagnose_cubeprogrammer()
+
+    def program_with_jlink_config(self, firmware_path, device="STM32F103C8", interface="SWD", speed="4000", serial_no=None):
+        """Program using J-Link with configuration"""
+        self.log(f"🚀 Starting J-Link programming with config...", "INFO")
+        return self.stm32_programmer.program_with_jlink(
+            firmware_path, 
+            device=device,
+            interface=interface,
+            speed=speed,
+            serial_no=serial_no
+        )
+
+    def program_stm32_fallback_config(self, firmware_path, probe_type="JLINK", serial_no=None, frequency="4000"):
+        """Enhanced fallback programming with probe configuration"""
+        self.log(f"🚀 Starting STM32CubeProgrammer with {probe_type}...", "INFO")
+        return self.stm32_programmer.program_stm32_fallback(
+            firmware_path, 
+            probe_type=probe_type,
+            serial_no=serial_no,
+            frequency=frequency
+        )
+
+# -------------------------------
+# QTM Orchestrator Class - FIXED INITIALIZATION ORDER
+# -------------------------------
+class QTMOrchestrator(ctk.CTk):
+    def __init__(self):
+        try:
+            print("Initializing QTMOrchestrator...")
+            super().__init__()
+            
+            # Configure window FIRST
+            self.title("ASIS Automated Production")
+            self.geometry("1100x700")  # Reduced size for better fit
+            self.minsize(1000, 600)
+            
+            # Status variables
+            self.current_status = "Ready"
+            self.connection_status = "Disconnected"
+            
+            # Default settings - Set COM8 as default for QTM
+            self.current_com_port = "COM8"  # Default COM for QTM
+            self.current_baud_rate = 9600
+            self.current_slave_id = 1
+            
+            # Connection management
+            self.is_connected = False
+            self.is_COM9_connected = False
+            self.is_com3_connected = False  # COM3 connection status
+            self.is_usb_connected = False   # NEW: USB connection status
+            self.stlink_method = "None"     # NEW: Track which STLink method is used
+            
+            # Initialize QTM Communicator BEFORE UI setup
+            self.qtm_communicator = QTMCommunicator(QTMConfig, self.log_event)
+            
+            # Initialize UI components AFTER communicator
+            self.setup_ui()
+            
+            print("UI setup completed successfully")
+            
+        except Exception as e:
+            print(f"Error during initialization: {e}")
+            print(traceback.format_exc())
+            raise
+
+    def setup_ui(self):
+        """Setup the user interface with proper initialization order"""
+        try:
+            print("Starting UI setup...")
+            
+            # Create main grid
+            self.grid_columnconfigure(0, weight=1)
+            self.grid_rowconfigure(1, weight=1)
+            
+            # Header with Logo
+            self.header_frame = ctk.CTkFrame(self, corner_radius=0)
+            self.header_frame.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+            self.header_frame.grid_columnconfigure(0, weight=1)
+            
+            # Setup logo - NOW THIS EXISTS
+            self.setup_logo()
+            print("Logo setup completed")
+            
+            # Main content area
+            self.main_frame = ctk.CTkFrame(self)
+            self.main_frame.grid(row=1, column=0, sticky="nsew", padx=20, pady=20)
+            self.main_frame.grid_columnconfigure(0, weight=1)
+            self.main_frame.grid_rowconfigure(3, weight=1)
+            
+            # System Control below Logo
+            self.setup_control_panel()
+            print("System Control setup completed")
+            
+            # Functions below System Control
+            self.setup_function_panel()
+            print("Functions setup completed")
+            
+            # Automated Production System below Functions
+            self.setup_status_dashboard()
+            print("Automated Production System setup completed")
+            
+            # Log panel at the bottom
+            self.setup_log_panel()
+            print("Log panel setup completed")
+            
+            print("UI setup completed successfully")
+            
+        except Exception as e:
+            print(f"Error in setup_ui: {e}")
+            print(traceback.format_exc())
+            raise
+
+    def setup_logo(self):
+        """Simple and safe logo setup"""
+        try:
+            print("Setting up logo...")
+            logo_path = "asis_logo.png"
+            if not os.path.exists(logo_path):
+                print(f"Logo file not found: {logo_path}")
+                text_logo = ctk.CTkLabel(
+                    self.header_frame, 
+                    text="ASIS TECHNOLOGIES", 
+                    font=ctk.CTkFont(size=24, weight="bold")
+                )
+                text_logo.grid(row=0, column=0, pady=20)
+                print("Using text logo as fallback")
+                return
+            
+            pil_image = Image.open(logo_path)
+            print(f"Image loaded: {pil_image.size}")
+            
+            logo_image = ctk.CTkImage(
+                light_image=pil_image,
+                dark_image=pil_image,
+                size=(250, 60)
+            )
+            
+            logo_label = ctk.CTkLabel(
+                self.header_frame,
+                image=logo_image,
+                text=""
+            )
+            logo_label.grid(row=0, column=0, pady=15)
+            print("Logo setup successful")
+            
+        except Exception as e:
+            print(f"Logo setup failed: {e}")
+            ctk.CTkLabel(
+                self.header_frame, 
+                text="ASIS TECHNOLOGIES", 
+                font=ctk.CTkFont(size=24, weight="bold")
+            ).grid(row=0, column=0, pady=20)
+            print("Using text logo as fallback")
+
+    def setup_control_panel(self):
+        """Setup System Control panel - Now at row 0"""
+        try:
+            control_frame = ctk.CTkFrame(self.main_frame)
+            control_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+            control_frame.grid_columnconfigure(0, weight=1)
+            
+            ctk.CTkLabel(control_frame, text="AUTOMATED PRODUCTION SYSTEM", 
+                        font=ctk.CTkFont(size=16, weight="bold")).pack(pady=10)
+            
+            button_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+            button_frame.pack(expand=True, pady=20)
+            
+            self.start_btn = ctk.CTkButton(button_frame, text="▶ START", 
+                                          command=self.start_listening,
+                                          font=ctk.CTkFont(size=14, weight="bold"),
+                                          height=40, fg_color="#2E7D32", hover_color="#1B5E20")
+            self.start_btn.pack(side="left", padx=10, pady=10)
+            
+            self.stop_btn = ctk.CTkButton(button_frame, text="■ STOP", 
+                                         command=self.stop_listening,
+                                         font=ctk.CTkFont(size=14, weight="bold"),
+                                         height=40, fg_color="#C62828", hover_color="#B71C1C",
+                                         state="disabled")
+            self.stop_btn.pack(side="left", padx=10, pady=10)
+            
+            self.settings_btn = ctk.CTkButton(button_frame, text="⚙ SETTINGS", 
+                                             command=self.show_settings,
+                                             font=ctk.CTkFont(size=14),
+                                             height=40)
+            self.settings_btn.pack(side="left", padx=10, pady=10)
+            
+            self.test_btn = ctk.CTkButton(button_frame, text="🔧 TEST QTM", 
+                                         command=self.test_qtm_communication,
+                                         font=ctk.CTkFont(size=14),
+                                         height=40, fg_color="#1976D2", hover_color="#1565C0")
+            self.test_btn.pack(side="left", padx=10, pady=10)
+            
+            # FW Update Button
+            self.fw_update_btn = ctk.CTkButton(button_frame, text="🔄 FW UPDATE", 
+                                             command=self.show_fw_update_dialog,
+                                             font=ctk.CTkFont(size=14, weight="bold"),
+                                             height=40, fg_color="#FF9800", hover_color="#F57C00")
+            self.fw_update_btn.pack(side="left", padx=10, pady=10)
+            
+        except Exception as e:
+            print(f"Error in setup_control_panel: {e}")
+            raise
+
+    def setup_function_panel(self):
+        """Setup Functions panel - Compact 2-row layout"""
+        try:
+            function_frame = ctk.CTkFrame(self.main_frame)
+            function_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+            function_frame.grid_columnconfigure(0, weight=1)
+            
+            ctk.CTkLabel(function_frame, text="FUNCTIONS", 
+                        font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+            
+            # Create two compact rows without scrollable frame
+            rows_frame = ctk.CTkFrame(function_frame, fg_color="transparent", height=80)
+            rows_frame.pack(fill="x", pady=5)
+            rows_frame.pack_propagate(False)
+            
+            # Row 1
+            row1_frame = ctk.CTkFrame(rows_frame, fg_color="transparent", height=35)
+            row1_frame.pack(fill="x", pady=2)
+            
+            # Row 2
+            row2_frame = ctk.CTkFrame(rows_frame, fg_color="transparent", height=35)
+            row2_frame.pack(fill="x", pady=2)
+            
+            # Smaller button sizes
+            btn_width = 70
+            btn_height = 28
+            font_size = 10
+            
+            # Store all function buttons in a list for easy management
+            self.function_buttons = []
+            
+            # Row 1 buttons - create and store as individual attributes
+            buttons_row1 = [
+                ("poll_btn", "📋 POLL", self.send_poll_command, "#1976D2", btn_width),
+                ("button_read_btn", "🔘 BTN", self.send_button_read, "#388E3C", btn_width),
+                ("relay1_on_btn", "R1 ON", self.send_relay1_on, "#D32F2F", 60),
+                ("relay1_off_btn", "R1 OFF", self.send_relay1_off, "#757575", 60),
+                ("relay2_on_btn", "R2 ON", self.send_relay2_on, "#D32F2F", 60),
+                ("relay2_off_btn", "R2 OFF", self.send_relay2_off, "#757575", 60),
+                ("r1m_on_btn", "R1M ON", self.send_r1m_on, "#D32F2F", 60),
+                ("r1m_off_btn", "R1M OFF", self.send_r1m_off, "#757575", 60),
+                ("r2m_on_btn", "R2M ON", self.send_r2m_on, "#D32F2F", 60),
+                ("r2m_off_btn", "R2M OFF", self.send_r2m_off, "#757575", 60),
+            ]
+            
+            for attr_name, text, command, color, width in buttons_row1:
+                btn = ctk.CTkButton(row1_frame, text=text, command=command,
+                                   font=ctk.CTkFont(size=font_size), height=btn_height, 
+                                   width=width, fg_color=color)
+                btn.pack(side="left", padx=1)
+                setattr(self, attr_name, btn)  # Set as individual attribute
+                self.function_buttons.append(btn)
+            
+            # Row 2 buttons - create and store as individual attributes
+            buttons_row2 = [
+                ("r3m_on_btn", "R3M ON", self.send_r3m_on, "#D32F2F", 60),
+                ("r3m_off_btn", "R3M OFF", self.send_r3m_off, "#757575", 60),
+                ("r4m_on_btn", "R4M ON", self.send_r4m_on, "#D32F2F", 60),
+                ("r4m_off_btn", "R4M OFF", self.send_r4m_off, "#757575", 60),
+                ("r5m_on_btn", "R5M ON", self.send_r5m_on, "#D32F2F", 60),
+                ("r5m_off_btn", "R5M OFF", self.send_r5m_off, "#757575", 60),
+                ("r6m_on_btn", "R6M ON", self.send_r6m_on, "#D32F2F", 60),
+                ("r6m_off_btn", "R6M OFF", self.send_r6m_off, "#757575", 60),
+                ("r7m_on_btn", "R7M ON", self.send_r7m_on, "#D32F2F", 60),
+                ("r7m_off_btn", "R7M OFF", self.send_r7m_off, "#757575", 60),
+                ("r8m_on_btn", "R8M ON", self.send_r8m_on, "#D32F2F", 60),
+                ("r8m_off_btn", "R8M OFF", self.send_r8m_off, "#757575", 60),
+                ("input_read_btn", "📥 IN", self.send_input_capture_read, "#7B1FA2", 60),
+                ("adc_read_btn", "📊 ADC", self.send_adc_read, "#F57C00", 60),
+            ]
+            
+            for attr_name, text, command, color, width in buttons_row2:
+                btn = ctk.CTkButton(row2_frame, text=text, command=command,
+                                   font=ctk.CTkFont(size=font_size), height=btn_height, 
+                                   width=width, fg_color=color)
+                btn.pack(side="left", padx=1)
+                setattr(self, attr_name, btn)  # Set as individual attribute
+                self.function_buttons.append(btn)
+            
+            # Initially disable function buttons until START is pressed
+            self.set_function_buttons_state("disabled")
+            
+        except Exception as e:
+            print(f"Error in setup_function_panel: {e}")
+            raise
+
+    def setup_status_dashboard(self):
+        """Setup Automated Production System status dashboard"""
+        try:
+            status_frame = ctk.CTkFrame(self.main_frame)
+            status_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
+            status_frame.grid_columnconfigure(1, weight=1)
+            
+            ctk.CTkLabel(status_frame, text="STATUS DASHBOARD", 
+                        font=ctk.CTkFont(size=18, weight="bold")).grid(row=0, column=0, columnspan=2, pady=10)
+            
+            self.status_indicators = {}
+            
+            # Indicators with COM9 and STLink status - MODIFIED
+            indicators = [
+                ("Connection", "connection_status", "Disconnected", "gray"),
+                ("Main Status", "main_status", "Ready", "gray"),
+                ("Data Flow", "data_status", "No Data", "gray"),
+                ("STLink Method", "stlink_method", "Not Connected", "gray")  # NEW: STLink method indicator
+            ]
+            
+            for i, (label, key, value, color) in enumerate(indicators):
+                ctk.CTkLabel(status_frame, text=f"{label}:", 
+                            font=ctk.CTkFont(weight="bold")).grid(row=i+1, column=0, sticky="w", padx=10, pady=5)
+                
+                if key == "data_status":
+                    self.status_indicators[key] = ctk.CTkLabel(status_frame, text=value,
+                                                             text_color=color,
+                                                             font=ctk.CTkFont(weight="bold"),
+                                                             wraplength=800)
+                else:
+                    self.status_indicators[key] = ctk.CTkLabel(status_frame, text=value,
+                                                             text_color=color,
+                                                             font=ctk.CTkFont(weight="bold"))
+                
+                self.status_indicators[key].grid(row=i+1, column=1, sticky="w", padx=10, pady=5)
+            
+        except Exception as e:
+            print(f"Error in setup_status_dashboard: {e}")
+            raise
+
+    def setup_log_panel(self):
+        """Setup log panel at the bottom"""
+        try:
+            log_frame = ctk.CTkFrame(self.main_frame)
+            log_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=10)
+            log_frame.grid_columnconfigure(0, weight=1)
+            log_frame.grid_rowconfigure(1, weight=1)
+            
+            self.main_frame.grid_rowconfigure(3, weight=1)
+            
+            ctk.CTkLabel(log_frame, text="EVENT LOG", 
+                        font=ctk.CTkFont(size=16, weight="bold")).grid(row=0, column=0, sticky="w", padx=10, pady=10)
+            
+            self.log_text = ctk.CTkTextbox(log_frame, height=150)
+            self.log_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+            self.log_text.insert("1.0", "System initialized. Ready to start listening...\n")
+            
+        except Exception as e:
+            print(f"Error in setup_log_panel: {e}")
+            raise
+
+    def log_event(self, message, level="INFO"):
+        """Add event to log"""
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            color_map = {"INFO": "white", "SUCCESS": "#4CAF50", "ERROR": "#F44336", "WARNING": "#FF9800"}
+            color = color_map.get(level, "white")
+            
+            log_entry = f"[{timestamp}] {level}: {message}\n"
+            
+            # Use after() to safely update the UI from any thread
+            self.after(0, self._safe_log_update, log_entry, color)
+            
+            # Also print to console for debugging
+            print(f"[{timestamp}] {level}: {message}")
+            
+        except Exception as e:
+            print(f"Error in log_event: {e}")
+
+    def _safe_log_update(self, log_entry, color):
+        """Safely update the log text widget from main thread"""
+        try:
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.insert("end", log_entry)
+                self.log_text.see("end")
+        except Exception as e:
+            print(f"Error in safe_log_update: {e}")
+
+    def update_status(self, key, message, color="white"):
+        """Update status indicator"""
+        if hasattr(self, 'status_indicators') and key in self.status_indicators:
+            self.status_indicators[key].configure(text=message, text_color=color)
+
+    def set_function_buttons_state(self, state):
+        """Enable/disable function buttons"""
+        if hasattr(self, 'function_buttons'):
+            for button in self.function_buttons:
+                if button:
+                    button.configure(state=state)
+
+    def start_listening(self):
+        """Start continuous listening for incoming QTM data - CONNECTS TO ALL PORTS"""
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        
+        self.update_status("main_status", "Connecting to all ports...", "#2196F3")
+        self.update_status("connection_status", "Connecting...", "#FF9800")
+        self.update_status("data_status", "Initializing connections...", "#FF9800")
+        self.update_status("stlink_method", "Detecting...", "#FF9800")  # NEW
+        self.log_event("Starting multi-port connection sequence", "INFO")
+        
+        # Start connection process in thread
+        thread = threading.Thread(target=self._connect_all_ports_and_listen, daemon=True)
+        thread.start()
+
+    def _connect_all_ports_and_listen(self):
+        """Connect to all required ports and start listening"""
+        try:
+            # Connect to all ports: COM8 (QTM), COM9 (Output), and either COM3 or USB (STLink)
+            connection_results, stlink_method = self.qtm_communicator.connect_all_ports()
+            
+            # Update connection status based on results
+            self.is_connected = connection_results['COM8']
+            self.is_COM9_connected = connection_results['COM9']
+            self.stlink_method = stlink_method
+            
+            # Set the specific STLink connection status
+            if stlink_method == "COM3":
+                self.is_com3_connected = True
+                self.is_usb_connected = False
+            elif stlink_method == "USB":
+                self.is_com3_connected = False
+                self.is_usb_connected = True
+            else:
+                self.is_com3_connected = False
+                self.is_usb_connected = False
+            
+            # Update UI based on connection results
+            if any(connection_results.values()):
+                connection_text = f"Connected to {sum(connection_results.values())}/3 ports"
+                if connection_results['STLink']:
+                    connection_text += f" (STLink: {stlink_method})"
+                
+                self.after(0, self.update_status, "connection_status", connection_text, "#4CAF50")
+                self.after(0, self.update_status, "stlink_method", f"{stlink_method}", "#4CAF50")  # NEW
+                self.after(0, self.update_status, "main_status", "Continuous Listening...", "#2196F3")
+                
+                # Enable function buttons when connections are established
+                self.after(0, self.set_function_buttons_state, "normal")
+                
+                # Start continuous listening for QTM data
+                self.qtm_communicator.start_listening()
+                self.after(0, self.log_event, "🎧 Started continuous listening for QTM data", "SUCCESS")
+                
+                # Start the continuous listening loop
+                self._start_continuous_listening_loop()
+            else:
+                self.after(0, self.update_status, "connection_status", "All connections failed", "#F44336")
+                self.after(0, self.update_status, "stlink_method", "Failed", "#F44336")  # NEW
+                self.after(0, self.update_status, "main_status", "Connection Failed", "#F44336")
+                self.after(0, self.stop_listening)
+                
+        except Exception as e:
+            self.after(0, self.log_event, f"💥 Connection error: {str(e)}", "ERROR")
+            self.after(0, self.stop_listening)
+
+    def _start_continuous_listening_loop(self):
+        """Start the continuous listening loop for QTM data"""
+        try:
+            self.after(0, self.update_status, "main_status", "Waiting for QTM frames...", "#2196F3")
+            
+            # Continuous listening loop
+            while self.qtm_communicator.listening_active and self.is_connected:
+                # Wait for incoming data from QTM (COM8)
+                response = self.qtm_communicator.read_continuous_data()
+                
+                if response:
+                    # Update Data Flow with actual FULL frame bytes
+                    self.after(0, self.update_data_flow, response)
+                    
+                    # Process the received data
+                    self.after(0, self.process_qtm_response, response)
+                    
+                    # Continue listening for next frame
+                    self.after(0, self.log_event, "✅ Frame processed - Waiting for next frame...", "SUCCESS")
+                else:
+                    # Break if listening was stopped
+                    break
+            
+            self.after(0, self.log_event, "🛑 Continuous listening ended", "INFO")
+            
+        except Exception as e:
+            self.after(0, self.log_event, f"💥 Listening error: {str(e)}", "ERROR")
+        finally:
+            # Only call stop_listening if we're still connected
+            if self.is_connected:
+                self.after(0, self.stop_listening)
+
+    def stop_listening(self):
+        """Stop continuous listening and disconnect all ports"""
+        self.start_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        
+        self.update_status("main_status", "Stopped", "#F44336")
+        self.update_status("connection_status", "Disconnected", "gray")
+        self.update_status("data_status", "No Data", "gray")
+        self.update_status("stlink_method", "Not Connected", "gray")  # NEW
+        self.log_event("Continuous listening stopped - All ports disconnected", "INFO")
+        
+        # Disable function buttons when STOP is pressed
+        self.set_function_buttons_state("disabled")
+        
+        # Stop QTM communicator listening and disconnect all ports
+        self.qtm_communicator.stop_listening()
+        self.qtm_communicator.disconnect()
+        self.is_connected = False
+        self.is_COM9_connected = False
+        self.is_com3_connected = False
+        self.is_usb_connected = False
+        self.stlink_method = "None"
+
+    def update_data_flow(self, frame_bytes):
+        """Update Data Flow with full frame bytes"""
+        try:
+            if frame_bytes:
+                # Convert bytes to hex string with spaces - NO TRUNCATION
+                hex_string = frame_bytes.hex(' ').upper()
+                
+                # UPDATE MAIN STATUS BASED ON DATA FLOW
+                main_status = QTMConfig.get_main_status_from_data_flow(hex_string)
+                self.update_status("main_status", main_status, "#4CAF50")
+                
+                # Update Data Flow display
+                self.update_status("data_status", hex_string, "#4CAF50")
+            else:
+                self.update_status("main_status", "No Data", "gray")
+                self.update_status("data_status", "No Data", "gray")
+        except Exception as e:
+            print(f"Error updating data flow: {e}")
+            self.update_status("main_status", "Error", "#F44336")
+            self.update_status("data_status", "Error", "#F44336")
+
+    def process_qtm_response(self, response):
+        """Process QTM response data"""
+        try:
+            hex_response = response.hex(' ').upper()
+            self.after(0, self.log_event, f"📊 Processing QTM frame: {hex_response}", "SUCCESS")
+            
+            # Parse the response using the new parser
+            parsed = self.qtm_communicator.parse_modbus_response(response)
+            if parsed:
+                result = self.qtm_communicator.process_function_code(parsed)
+            
+            # Analyze response structure
+            response_length = len(response)
+            self.after(0, self.log_event, f"   📏 Frame length: {response_length} bytes", "INFO")
+            
+            # Display first few bytes
+            if response_length > 0:
+                first_bytes = ' '.join(f"{b:02X}" for b in response[:min(8, response_length)])
+                self.after(0, self.log_event, f"   🔍 First bytes: {first_bytes}", "INFO")
+            
+            # Check for specific patterns in response
+            if response_length >= 2:
+                if response[0] == 0x00 and response[1] == 0x01:
+                    self.after(0, self.log_event, "   ✅ Frame matches expected pattern", "SUCCESS")
+                else:
+                    self.after(0, self.log_event, "   ⚠️ Frame pattern unexpected", "WARNING")
+                    
+        except Exception as e:
+            self.after(0, self.log_event, f"❌ Frame processing error: {str(e)}", "ERROR")
+
+    def test_qtm_communication(self):
+        """Test QTM communication by sending a frame (for testing only)"""
+        self.log_event("🧪 Testing QTM communication (sending test frame)", "INFO")
+        
+        # Run test in separate thread
+        thread = threading.Thread(target=self._run_qtm_test, daemon=True)
+        thread.start()
+
+    def _run_qtm_test(self):
+        """Run QTM communication test"""
+        try:
+            # Connect to QTM - Use COM8 for testing (QTM default)
+            if self.qtm_communicator.connect("COM8", self.current_baud_rate):
+                self.after(0, self.update_status, "connection_status", "Connected", "#4CAF50")
+                
+                # Send frame and get response (only for testing)
+                response = self.qtm_communicator.send_frame(QTMConfig.get_frame(), retries=3)
+                
+                if response:
+                    self.after(0, self.update_status, "data_status", "QTM Communication Successful", "#4CAF50")
+                    
+                    # Process the response
+                    self.process_qtm_response(response)
+                else:
+                    self.after(0, self.update_status, "data_status", "No QTM Response", "#F44336")
+                    self.after(0, self.log_event, "❌ QTM device did not respond", "ERROR")
+                
+                # Disconnect
+                self.qtm_communicator.disconnect()
+                self.after(0, self.update_status, "connection_status", "Disconnected", "gray")
+                
+            else:
+                self.after(0, self.log_event, f"❌ Failed to connect to COM8", "ERROR")
+                self.after(0, self.update_status, "connection_status", "Connection Failed", "#F44336")
+                
+        except Exception as e:
+            self.after(0, self.log_event, f"💥 QTM test error: {str(e)}", "ERROR")
+
+    def show_fw_update_dialog(self):
+        """Simplified firmware update dialog with auto-detection"""
+        self.log_event("🔄 Opening Firmware Update Dialog", "INFO")
+    
+        try:
+            fw_dialog = ctk.CTkToplevel(self)
+            fw_dialog.title("STM32 Firmware Update")
+            fw_dialog.geometry("700x700")
+            fw_dialog.transient(self)
+            fw_dialog.grab_set()
+        
+            main_frame = ctk.CTkFrame(fw_dialog)
+            main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+            ctk.CTkLabel(main_frame, text="STM32 FIRMWARE UPDATE", 
+                        font=ctk.CTkFont(size=20, weight="bold")).pack(pady=20)
+        
+            # Auto-detection info frame
+            info_frame = ctk.CTkFrame(main_frame)
+            info_frame.pack(fill="x", padx=10, pady=10)
+        
+            ctk.CTkLabel(info_frame, text="Auto-Detection Mode:", 
+                        font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        
+            info_text = ctk.CTkLabel(info_frame, 
+                                   text="The system will automatically detect and use the best available programming method:\n"
+                                        "1. J-Link (if available)\n"
+                                        "2. ST-Link with pystlink\n"
+                                        "3. STM32CubeProgrammer fallback",
+                                   text_color="#4CAF50",
+                                   font=ctk.CTkFont(size=12),
+                                   justify="left")
+            info_text.pack(pady=10)
+        
+            # File selection frame
+            file_frame = ctk.CTkFrame(main_frame)
+            file_frame.pack(fill="x", padx=10, pady=10)
+        
+            ctk.CTkLabel(file_frame, text="Firmware File:", 
+                        font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        
+            file_selection_frame = ctk.CTkFrame(file_frame, fg_color="transparent")
+            file_selection_frame.pack(fill="x", padx=10, pady=5)
+        
+            self.fw_file_path = ctk.CTkEntry(file_selection_frame, placeholder_text="Select firmware file...")
+            self.fw_file_path.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        
+            browse_btn = ctk.CTkButton(file_selection_frame, text="Browse", 
+                                      command=self.browse_firmware_file,
+                                      width=80)
+            browse_btn.pack(side="right")
+        
+            # Progress frame
+            progress_frame = ctk.CTkFrame(main_frame)
+            progress_frame.pack(fill="x", padx=10, pady=10)
+        
+            ctk.CTkLabel(progress_frame, text="Update Progress:", 
+                        font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        
+            self.progress_bar = ctk.CTkProgressBar(progress_frame, height=20)
+            self.progress_bar.pack(fill="x", padx=10, pady=5)
+            self.progress_bar.set(0)
+        
+            self.progress_label = ctk.CTkLabel(progress_frame, text="0%")
+            self.progress_label.pack(pady=5)
+        
+            # Status frame
+            status_frame = ctk.CTkFrame(main_frame)
+            status_frame.pack(fill="x", padx=10, pady=10)
+        
+            ctk.CTkLabel(status_frame, text="Status:", 
+                        font=ctk.CTkFont(size=14, weight="bold")).pack(pady=5)
+        
+            self.status_label = ctk.CTkLabel(status_frame, text="Ready - Select firmware file and click Start", 
+                                           text_color="white")
+            self.status_label.pack(pady=5)
+        
+            # Button frame
+            button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+            button_frame.pack(fill="x", padx=10, pady=20)
+        
+            # Start Update Button
+            self.start_update_btn = ctk.CTkButton(button_frame, text="START UPDATE", 
+                                                command=self.start_firmware_update,
+                                                fg_color="#2E7D32", hover_color="#1B5E20",
+                                                font=ctk.CTkFont(size=14, weight="bold"),
+                                                height=40)
+            self.start_update_btn.pack(side="left", padx=5)
+        
+            # Test buttons (optional, can be removed if not needed)
+            test_btn = ctk.CTkButton(button_frame, text="Test Connection", 
+                                   command=self.test_programmer_connections,
+                                   fg_color="#1976D2", hover_color="#1565C0")
+            test_btn.pack(side="left", padx=5)
+        
+            cancel_btn = ctk.CTkButton(button_frame, text="Cancel", 
+                                      command=fw_dialog.destroy,
+                                      fg_color="#757575", hover_color="#616161")
+            cancel_btn.pack(side="left", padx=5)
+        
+            self.fw_dialog = fw_dialog
+            self.log_event("✅ Simplified firmware update dialog opened", "SUCCESS")
+        
+        except Exception as e:
+            self.log_event(f"❌ Error opening firmware update dialog: {str(e)}", "ERROR")
+
+    def show_settings(self):
+        """Show settings dialog (minimal implementation)"""
+        self.log_event("⚙ Settings feature not yet implemented", "INFO")
+    
+        # Create a simple settings dialog
+        settings_dialog = ctk.CTkToplevel(self)
+        settings_dialog.title("Settings")
+        settings_dialog.geometry("400x300")
+        settings_dialog.transient(self)
+    
+        main_frame = ctk.CTkFrame(settings_dialog)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+    
+        ctk.CTkLabel(main_frame, text="SETTINGS", 
+                    font=ctk.CTkFont(size=20, weight="bold")).pack(pady=20)
+    
+        # Add some basic settings (you can expand this later)
+        settings_content = ctk.CTkLabel(main_frame, 
+                                      text="Settings feature is under development.\n\n"
+                                           "Available in future versions:\n"
+                                           "• COM port configuration\n"
+                                           "• Baud rate settings\n"
+                                           "• Logging options\n"
+                                           "• Theme selection",
+                                      font=ctk.CTkFont(size=12),
+                                      justify="left")
+        settings_content.pack(pady=20)
+    
+        close_btn = ctk.CTkButton(main_frame, text="Close", 
+                                 command=settings_dialog.destroy,
+                                 width=100)
+        close_btn.pack(pady=20)
+
+    def test_programmer_connections(self):
+        """Test all programmer connections"""
+        self.log_event("🧪 Testing programmer connections...", "INFO")
+        # This would test J-Link, ST-Link, etc.
+        # Implementation depends on what you want to test
+
+    def browse_firmware_file(self):
+        """Browse for firmware file"""
+        try:
+            from tkinter import filedialog
+            file_path = filedialog.askopenfilename(
+                title="Select STM32 Firmware File",
+                filetypes=[
+                    ("Binary files", "*.bin"),
+                    ("Hex files", "*.hex"), 
+                    ("All files", "*.*")
+                ]
+            )
+            if file_path:
+                self.fw_file_path.delete(0, "end")
+                self.fw_file_path.insert(0, file_path)
+                self.log_event(f"📁 Selected firmware file: {file_path}", "INFO")
+            
+        except Exception as e:
+            self.log_event(f"❌ Error browsing for firmware file: {str(e)}", "ERROR")
+
+    def start_firmware_update(self):
+        """Start firmware update process with auto-detection"""
+        file_path = self.fw_file_path.get()
+        if not file_path or not os.path.exists(file_path):
+            self.log_event("❌ Please select a valid firmware file", "ERROR")
+            return
+            
+        # Disable start button during update
+        self.start_update_btn.configure(state="disabled")
+        
+        self.log_event("🚀 Starting firmware update with auto-detection...", "INFO")
+        self.log_event("🔍 Detecting available programming methods...", "INFO")
+        
+        # Start update in separate thread with auto method
+        thread = threading.Thread(target=self._execute_firmware_update_auto, args=(file_path,), daemon=True)
+        thread.start()
+
+    def _execute_firmware_update_auto(self, file_path):
+        """Execute firmware update with auto-detection"""
+        try:
+            self.log_event("🔄 Auto-detecting best programming method...", "INFO")
+            self._update_progress(10)
+            self._update_status("Detecting hardware...")
+        
+            # Use auto-detection method
+            success, message = self.qtm_communicator.program_stm32_enhanced(file_path, method="auto")
+        
+            if success:
+                self._update_progress(100)
+                self._update_status("Update completed successfully!")
+                self.log_event("🎉 Firmware update completed successfully!", "SUCCESS")
+            else:
+                self._update_progress(0)
+                self._update_status(f"Error: {message}")
+                self.log_event(f"❌ Firmware update failed: {message}", "ERROR")
+        
+            # Re-enable button
+            self._enable_update_buttons()
+        
+        except Exception as e:
+            self.log_event(f"❌ Firmware update error: {str(e)}", "ERROR")
+            self._update_progress(0)
+            self._update_status(f"Error: {str(e)}")
+            self._enable_update_buttons()
+
+    def _enable_update_buttons(self):
+        """Re-enable update buttons after completion"""
+        if hasattr(self, 'start_update_btn'):
+            self.after(0, lambda: self.start_update_btn.configure(state="normal"))
+
+    def _update_progress(self, value):
+        """Update progress bar"""
+        def update():
+            if hasattr(self, 'progress_bar') and self.progress_bar:
+                self.progress_bar.set(value / 100)
+            if hasattr(self, 'progress_label') and self.progress_label:
+                self.progress_label.configure(text=f"{value}%")
+        self.after(0, update)
+
+    def _update_status(self, message):
+        """Update status label"""
+        def update():
+            if hasattr(self, 'status_label') and self.status_label:
+                self.status_label.configure(text=message)
+        self.after(0, update)
+
+    # ============================================================================
+    # FUNCTION BUTTON HANDLERS - ADD ALL MISSING METHODS
+    # ============================================================================
+
+    def send_poll_command(self):
+        """Send poll command to get firmware version"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("📋 Sending Poll Command (0x30)", "INFO")
+        thread = threading.Thread(target=self._execute_poll, daemon=True)
+        thread.start()
+
+    def _execute_poll(self):
+        """Execute poll command in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_poll()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_button_read(self):
+        """Send button read command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔘 Sending Button Read Command (0x31)", "INFO")
+        thread = threading.Thread(target=self._execute_button_read, daemon=True)
+        thread.start()
+
+    def _execute_button_read(self):
+        """Execute button read in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_button_read()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_relay1_on(self):
+        """Send R1 ON command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R1 ON Command", "INFO")
+        thread = threading.Thread(target=self._execute_relay1_on, daemon=True)
+        thread.start()
+
+    def _execute_relay1_on(self):
+        """Execute R1 ON command in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_relay1_on()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_relay2_on(self):
+        """Send R2 ON command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R2 ON Command", "INFO")
+        thread = threading.Thread(target=self._execute_relay2_on, daemon=True)
+        thread.start()
+
+    def _execute_relay2_on(self):
+        """Execute R2 ON command in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_relay2_on()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_relay1_off(self):
+        """Send R1 OFF command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R1 OFF Command", "INFO")
+        thread = threading.Thread(target=self._execute_relay1_off, daemon=True)
+        thread.start()
+
+    def _execute_relay1_off(self):
+        """Execute R1 OFF command in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_relay1_off()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_relay2_off(self):
+        """Send R2 OFF command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R2 OFF Command", "INFO")
+        thread = threading.Thread(target=self._execute_relay2_off, daemon=True)
+        thread.start()
+
+    def _execute_relay2_off(self):
+        """Execute R2 OFF command in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_relay2_off()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r1m_on(self):
+        """Send R1M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R1M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r1m_on, daemon=True)
+        thread.start()
+
+    def _execute_r1m_on(self):
+        """Execute R1M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r1m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r1m_off(self):
+        """Send R1M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R1M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r1m_off, daemon=True)
+        thread.start()
+
+    def _execute_r1m_off(self):
+        """Execute R1M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r1m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r2m_on(self):
+        """Send R2M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R2M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r2m_on, daemon=True)
+        thread.start()
+
+    def _execute_r2m_on(self):
+        """Execute R2M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r2m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r2m_off(self):
+        """Send R2M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R2M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r2m_off, daemon=True)
+        thread.start()
+
+    def _execute_r2m_off(self):
+        """Execute R2M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r2m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r3m_on(self):
+        """Send R3M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R3M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r3m_on, daemon=True)
+        thread.start()
+
+    def _execute_r3m_on(self):
+        """Execute R3M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r3m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r3m_off(self):
+        """Send R3M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R3M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r3m_off, daemon=True)
+        thread.start()
+
+    def _execute_r3m_off(self):
+        """Execute R3M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r3m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r4m_on(self):
+        """Send R4M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R4M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r4m_on, daemon=True)
+        thread.start()
+
+    def _execute_r4m_on(self):
+        """Execute R4M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r4m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r4m_off(self):
+        """Send R4M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R4M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r4m_off, daemon=True)
+        thread.start()
+
+    def _execute_r4m_off(self):
+        """Execute R4M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r4m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r5m_on(self):
+        """Send R5M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R5M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r5m_on, daemon=True)
+        thread.start()
+
+    def _execute_r5m_on(self):
+        """Execute R5M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r5m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r5m_off(self):
+        """Send R5M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R5M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r5m_off, daemon=True)
+        thread.start()
+
+    def _execute_r5m_off(self):
+        """Execute R5M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r5m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r6m_on(self):
+        """Send R6M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R6M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r6m_on, daemon=True)
+        thread.start()
+
+    def _execute_r6m_on(self):
+        """Execute R6M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r6m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r6m_off(self):
+        """Send R6M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R6M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r6m_off, daemon=True)
+        thread.start()
+
+    def _execute_r6m_off(self):
+        """Execute R6M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r6m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r7m_on(self):
+        """Send R7M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R7M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r7m_on, daemon=True)
+        thread.start()
+
+    def _execute_r7m_on(self):
+        """Execute R7M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r7m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r7m_off(self):
+        """Send R7M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R7M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r7m_off, daemon=True)
+        thread.start()
+
+    def _execute_r7m_off(self):
+        """Execute R7M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r7m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r8m_on(self):
+        """Send R8M ON command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R8M ON Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r8m_on, daemon=True)
+        thread.start()
+
+    def _execute_r8m_on(self):
+        """Execute R8M ON command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r8m_on()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_r8m_off(self):
+        """Send R8M OFF command"""
+        if not self.is_COM9_connected:
+            self.log_event("❌ COM9 not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("🔌 Sending R8M OFF Command via COM9", "INFO")
+        thread = threading.Thread(target=self._execute_r8m_off, daemon=True)
+        thread.start()
+
+    def _execute_r8m_off(self):
+        """Execute R8M OFF command in thread"""
+        if self.is_COM9_connected and self.qtm_communicator.ser_COM9 and self.qtm_communicator.ser_COM9.is_open:
+            frame = self.qtm_communicator.send_r8m_off()
+            response = self.qtm_communicator.send_frame(frame, use_COM9=True)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_input_capture_read(self):
+        """Send input capture read command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("📥 Sending Input Capture Read (0x32)", "INFO")
+        thread = threading.Thread(target=self._execute_input_capture_read, daemon=True)
+        thread.start()
+
+    def _execute_input_capture_read(self):
+        """Execute input capture read in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_input_capture_read()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def send_adc_read(self):
+        """Send ADC read command"""
+        if not self.is_connected:
+            self.log_event("❌ Not connected. Please press START first.", "ERROR")
+            return
+    
+        self.log_event("📊 Sending ADC Read Command (0x34)", "INFO")
+        thread = threading.Thread(target=self._execute_adc_read, daemon=True)
+        thread.start()
+
+    def _execute_adc_read(self):
+        """Execute ADC read in thread"""
+        if self.is_connected and self.qtm_communicator.ser and self.qtm_communicator.ser.is_open:
+            frame = self.qtm_communicator.send_adc_read()
+            response = self.qtm_communicator.send_frame(frame)
+            if response:
+                parsed = self.qtm_communicator.parse_modbus_response(response)
+                self.qtm_communicator.process_function_code(parsed)
+
+    def get_available_ports(self):
+        """Get list of available serial ports"""
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        available_ports = []
+        for port, desc, hwid in sorted(ports):
+            available_ports.append(port)
+        return available_ports
+
+    def diagnose_cubeprogrammer(self):
+        """Run STM32CubeProgrammer diagnostics"""
+        self.log_event("🔧 Running STM32CubeProgrammer diagnostics...", "INFO")
+        thread = threading.Thread(target=self._execute_diagnostic, daemon=True)
+        thread.start()
+
+    def _execute_diagnostic(self):
+        """Execute STM32CubeProgrammer diagnostic"""
+        try:
+            success, message = self.qtm_communicator.diagnose_cubeprogrammer()
+            if success:
+                self.after(0, self.log_event, f"✅ Diagnostic: {message}", "SUCCESS")
+            else:
+                self.after(0, self.log_event, f"❌ Diagnostic: {message}", "ERROR")
+        except Exception as e:
+            self.after(0, self.log_event, f"💥 Diagnostic error: {str(e)}", "ERROR")
+
+if __name__ == "__main__":
+    try:
+        print("Starting application...")
+        print("Python executable:", sys.executable)
+        print("Python version:", sys.version)
+        
+        app = QTMOrchestrator()
+        print("Application initialized, starting mainloop...")
+        app.mainloop()
+        
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        print(traceback.format_exc())
+        input("Press Enter to exit...")
